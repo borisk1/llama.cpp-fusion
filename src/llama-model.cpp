@@ -14,6 +14,7 @@
 #include "llama-kv-cache-iswa.h"
 #include "llama-kv-cache-dsa.h"
 #include "llama-kv-cache-dsv4.h"
+#include "llama-tensor-profiler.h"
 #include "llama-memory-hybrid.h"
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-memory-recurrent.h"
@@ -880,18 +881,6 @@ llm_ffn_op_type llm_ffn_op_type_from_string(const std::string & name, llm_ffn_op
 static buft_list_t make_cpu_buft_list(const std::vector<llama_device> & devices, bool use_extra_bufts, bool no_host) {
     buft_list_t buft_list;
 
-    // add ACCEL buffer types
-    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
-        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
-        if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_ACCEL) {
-            auto * buft = ggml_backend_dev_buffer_type(dev);
-            // skip
-            if (buft != ggml_backend_cpu_buffer_type()) {
-                buft_list.emplace_back(dev, buft);
-            }
-        }
-    }
-
     // add a host buffer type
     // storing the tensors in a host buffer is useful when the processing of large batches
     // is offloaded to a GPU device, since it reduces the time spent on data transfers
@@ -1623,6 +1612,99 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         return true;
     }
 
+    // tensor profiling (--profile-tensors)
+    bool profile_tensors = params.profile_tensors;
+    LLAMA_LOG_INFO("%s: profile_tensors = %d\n", __func__, profile_tensors);
+    if (profile_tensors) {
+        LLAMA_LOG_INFO("%s: profiling %d tensors...\n", __func__, n_layer_all);
+        llama_tensor_profiler profiler;
+
+        // For each layer, profile key tensors
+        for (int il = 0; il < n_layer_all; ++il) {
+            auto & layer = layers[il];
+            auto * dev = pimpl->dev_layer[il].dev;
+            auto backend_type = ggml_backend_dev_type(dev);
+
+            // Profile attention tensors
+            if (layer.attn_norm) {
+                profiler.begin_op(format("blk.%d.attn_norm.weight", il), "RMS_NORM", dev, ggml_nbytes(layer.attn_norm));
+                profiler.end_op(format("blk.%d.attn_norm.weight", il));
+            }
+            if (layer.wq_a) {
+                profiler.begin_op(format("blk.%d.wq_a.weight", il), "MUL_MAT", dev, ggml_nbytes(layer.wq_a));
+                profiler.end_op(format("blk.%d.wq_a.weight", il));
+            }
+            if (layer.wq_b) {
+                profiler.begin_op(format("blk.%d.wq_b.weight", il), "MUL_MAT", dev, ggml_nbytes(layer.wq_b));
+                profiler.end_op(format("blk.%d.wq_b.weight", il));
+            }
+            if (layer.wkv) {
+                profiler.begin_op(format("blk.%d.wkv.weight", il), "MUL_MAT", dev, ggml_nbytes(layer.wkv));
+                profiler.end_op(format("blk.%d.wkv.weight", il));
+            }
+            if (layer.wo_a) {
+                profiler.begin_op(format("blk.%d.wo_a.weight", il), "MUL_MAT", dev, ggml_nbytes(layer.wo_a));
+                profiler.end_op(format("blk.%d.wo_a.weight", il));
+            }
+            if (layer.wo_b) {
+                profiler.begin_op(format("blk.%d.wo_b.weight", il), "MUL_MAT", dev, ggml_nbytes(layer.wo_b));
+                profiler.end_op(format("blk.%d.wo_b.weight", il));
+            }
+
+            // Profile FFN tensors (MoE)
+            if (layer.ffn_gate_inp) {
+                profiler.begin_op(format("blk.%d.ffn_gate_inp.weight", il), "MUL_MAT", dev, ggml_nbytes(layer.ffn_gate_inp));
+                profiler.end_op(format("blk.%d.ffn_gate_inp.weight", il));
+            }
+            if (layer.ffn_gate_exps) {
+                profiler.begin_op(format("blk.%d.ffn_gate_exps.weight", il), "MUL_MAT_ID", dev, ggml_nbytes(layer.ffn_gate_exps));
+                profiler.end_op(format("blk.%d.ffn_gate_exps.weight", il));
+            }
+            if (layer.ffn_down_exps) {
+                profiler.begin_op(format("blk.%d.ffn_down_exps.weight", il), "MUL_MAT_ID", dev, ggml_nbytes(layer.ffn_down_exps));
+                profiler.end_op(format("blk.%d.ffn_down_exps.weight", il));
+            }
+            if (layer.ffn_up_exps) {
+                profiler.begin_op(format("blk.%d.ffn_up_exps.weight", il), "MUL_MAT_ID", dev, ggml_nbytes(layer.ffn_up_exps));
+                profiler.end_op(format("blk.%d.ffn_up_exps.weight", il));
+            }
+
+            // Profile shared experts
+            if (layer.ffn_gate_shexp) {
+                profiler.begin_op(format("blk.%d.ffn_gate_shexp.weight", il), "MUL_MAT", dev, ggml_nbytes(layer.ffn_gate_shexp));
+                profiler.end_op(format("blk.%d.ffn_gate_shexp.weight", il));
+            }
+            if (layer.ffn_down_shexp) {
+                profiler.begin_op(format("blk.%d.ffn_down_shexp.weight", il), "MUL_MAT", dev, ggml_nbytes(layer.ffn_down_shexp));
+                profiler.end_op(format("blk.%d.ffn_down_shexp.weight", il));
+            }
+            if (layer.ffn_up_shexp) {
+                profiler.begin_op(format("blk.%d.ffn_up_shexp.weight", il), "MUL_MAT", dev, ggml_nbytes(layer.ffn_up_shexp));
+                profiler.end_op(format("blk.%d.ffn_up_shexp.weight", il));
+            }
+        }
+
+        profiler.calculate_epd();
+        profiler.print_report();
+
+        // Solve knapsack with default VRAM budget (85% of available)
+        size_t vram_total = 0;
+        size_t vram_free = 0;
+        for (const auto & dev : devices) {
+            size_t total = 0, free = 0;
+            ggml_backend_dev_memory(dev.dev, &free, &total);
+            vram_total += total;
+            vram_free += free;
+        }
+        double budget = 0.85 * vram_free;
+        auto solution = profiler.solve_knapsack(budget, 12.0); // PCIe 3.0 x16 ≈ 12 GB/s
+
+        LLAMA_LOG_INFO("%s: knapsack solution: %zu GPU tensors (%.0f MB), benefit %.2f ms\n",
+                       __func__, solution.gpu_tensors.size(),
+                       solution.total_size / (1024.0 * 1024.0),
+                       solution.total_benefit);
+    }
+
     // load tensor data
     for (auto & [ctx, buf_map] : ctx_buf_maps) {
         if (!ml.load_all_data(ctx, buf_map, use_mlock ? &pimpl->mlock_mmaps : NULL, params.progress_callback, params.progress_callback_user_data)) {
@@ -2334,6 +2416,7 @@ llama_model_params llama_model_default_params() {
         /*.use_extra_bufts             =*/ true,
         /*.no_host                     =*/ false,
         /*.no_alloc                    =*/ false,
+        /*.profile_tensors             =*/ false,
     };
 
     return result;

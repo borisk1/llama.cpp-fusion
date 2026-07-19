@@ -2260,6 +2260,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_NO_HOST"));
     add_opt(common_arg(
+        {"--profile-tensors"},
+        "profile per-tensor CPU/GPU execution time for optimal placement",
+        [](common_params & params) {
+            params.profile_tensors = true;
+        }
+    ).set_env("LLAMA_ARG_PROFILE_TENSORS"));
+    add_opt(common_arg(
         {"-ctk", "--cache-type-k"}, "TYPE",
         string_format(
             "KV cache data type for K\n"
