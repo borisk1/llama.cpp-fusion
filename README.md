@@ -119,47 +119,120 @@ All measurements with `--flash-attn on -b 4096 -ub 512 --cache-type-k/q q8_0`.
 
 ---
 
-## Quick Start
+## Run Examples
 
-### Production server (4 slots, balanced)
+All examples assume a DeepSeek V4 Flash model (`DSV4-Flash-IQ2_XXS-MTP-merged.gguf`, ~79 GB). Adjust the model path for your setup.
 
-```bash
-bash scripts/prod-server.sh prod
-```
+### Single GPU + CPU hybrid (1× RTX 3090, model doesn't fit in VRAM)
 
-### Fast single-slot (max throughput)
-
-```bash
-bash scripts/prod-server.sh fast
-```
-
-### Single GPU + CPU hybrid
+Most common scenario — the 79 GB model far exceeds 24 GB VRAM. Attention runs on GPU, MoE experts stay in CPU RAM via CUDA_Host pinned memory.
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 \
 GGML_CUDA_MOE_CACHE=1 \
 GGML_CUDA_MOE_CACHE_BUDGET_MB=11000 \
-  ./build/bin/llama-server -m model.gguf \
-  --no-mmap --flash-attn on -c 200000 -t 12 \
-  -b 4096 -ub 512 --cpu-moe --thread-copy 0-5,6-11
+  ./build/bin/llama-server \
+  -m /path/to/DSV4-Flash-IQ2_XXS-MTP-merged.gguf \
+  --no-mmap --flash-attn on \
+  -c 200000 -t 12 \
+  -b 4096 -ub 512 \
+  --cpu-moe \
+  --no-jinja
 ```
 
-### Multi-GPU with MoE cache
+**Expected:** ~11-12 TG t/s, ~200 PP t/s (5K+ prompt)
+
+### Single GPU + MoE cache (no cpu-moe)
+
+Let the GPU handle everything it can. MoE cache reduces expert weight transfers by 70%.
+
+```bash
+CUDA_VISIBLE_DEVICES=0 \
+GGML_CUDA_MOE_CACHE=1 \
+GGML_CUDA_MOE_CACHE_BUDGET_MB=11000 \
+  ./build/bin/llama-server \
+  -m /path/to/DSV4-Flash-IQ2_XXS-MTP-merged.gguf \
+  --no-mmap --flash-attn on \
+  -c 200000 -t 12 \
+  -b 4096 -ub 4096 \
+  --cache-type-k q8_0 --cache-type-v q8_0 \
+  --no-jinja
+```
+
+### Multi-GPU (4× RTX 3090, full VRAM offload)
+
+When your total VRAM exceeds model size (96 GB > 79 GB), the entire model fits on GPUs. No PCIe weight streaming during inference.
 
 ```bash
 GGML_CUDA_MOE_CACHE=1 \
 GGML_CUDA_MOE_CACHE_BUDGET_MB=11000 \
-  ./build/bin/llama-server -m model.gguf \
-  --no-mmap --flash-attn on -c 200000 -t 12 \
-  -b 4096 -ub 512 --cache-type-k q8_0 --cache-type-v q8_0
+  ./build/bin/llama-server \
+  -m /path/to/DSV4-Flash-IQ2_XXS-MTP-merged.gguf \
+  --no-mmap --flash-attn on \
+  -c 200000 -t 12 \
+  -b 4096 -ub 512 \
+  --cache-type-k q8_0 --cache-type-v q8_0 \
+  --no-jinja
 ```
 
-### Systemd service
+**Expected:** ~35-38 TG t/s, ~500+ PP t/s (5K+ prompt)
+
+### Multi-GPU + Thread Copy (dual Xeon + 4 GPU)
+
+Maximum hardware utilization — NUMA-aware CPU execution across two sockets + all GPUs.
 
 ```bash
+numactl --cpunodebind=0 --membind=0 \
+GGML_CUDA_MOE_CACHE=1 \
+GGML_CUDA_MOE_CACHE_BUDGET_MB=11000 \
+  ./build/bin/llama-server \
+  -m /path/to/DSV4-Flash-IQ2_XXS-MTP-merged.gguf \
+  --no-mmap --flash-attn on \
+  -c 200000 -t 12 \
+  -b 4096 -ub 512 \
+  --cpu-moe \
+  --thread-copy 0-5,6-11 \
+  --cache-type-k q8_0 --cache-type-v q8_0 \
+  --no-jinja
+```
+
+`--thread-copy 0-5,6-11` splits 12 threads into 2 groups of 6. Group 0 runs on NUMA node 0 cores 0-5, group 1 on cores 6-11. Adjust for your CPU topology.
+
+### Thread Copy for dual Xeon (CPU-only decode)
+
+When you have massive RAM but zero or limited GPU. Thread Copy splits threads across sockets for NUMA-local memory access.
+
+```bash
+numactl --cpunodebind=0 --membind=0 \
+  ./build/bin/llama-server \
+  -m /path/to/model.gguf \
+  --no-mmap -c 100000 -t 24 \
+  --thread-copy 0-5,6-11,12-17,18-23
+```
+
+4 groups of 6 threads each — one group per L3 cache domain. Improves memory-bound decode on multi-socket systems by keeping memory access local.
+
+### Production server (systemd)
+
+```bash
+# Install service
 cp scripts/llama-dsv4.service /etc/systemd/system/
 systemctl daemon-reload
 systemctl enable --now llama-dsv4
+
+# Or run directly
+bash scripts/prod-server.sh prod   # 4 slots, balanced
+bash scripts/prod-server.sh fast   # 1 slot, max speed
+```
+
+### Benchmark quick test
+
+```bash
+GGML_CUDA_MOE_CACHE=1 \
+GGML_CUDA_MOE_CACHE_BUDGET_MB=11000 \
+  ./build/bin/llama-bench \
+  -m /path/to/DSV4-Flash-IQ2_XXS-MTP-merged.gguf \
+  -p 512 -n 128 -ngl 999 -t 12 -r 1
 ```
 
 ---
