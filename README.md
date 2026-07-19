@@ -123,6 +123,8 @@ All measurements with `--flash-attn on -b 4096 -ub 512 --cache-type-k/q q8_0`.
 
 All examples assume a DeepSeek V4 Flash model (`DSV4-Flash-IQ2_XXS-MTP-merged.gguf`, ~79 GB). Adjust the model path for your setup.
 
+> **Note on hardware:** All benchmarks were performed on a system with 4× RTX 3090 connected via **OCuLink** (PCIe 3.0 x4 per link, aggregated). OCuLink bandwidth is lower than direct PCIe 3.0 x16 slots — expect higher throughput on systems with native PCIe 4.0. The MoE Cache and CPU-MoE hybrid modes are especially beneficial on OCuLink setups, as they minimize PCIe transfers.
+
 ### Single GPU + CPU hybrid (1× RTX 3090, model doesn't fit in VRAM)
 
 Most common scenario — the 79 GB model far exceeds 24 GB VRAM. Attention runs on GPU, MoE experts stay in CPU RAM via CUDA_Host pinned memory.
