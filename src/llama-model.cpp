@@ -1614,9 +1614,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     // tensor profiling (--profile-tensors)
     bool profile_tensors = params.profile_tensors;
-    LLAMA_LOG_INFO("%s: profile_tensors = %d\n", __func__, profile_tensors);
     if (profile_tensors) {
-        LLAMA_LOG_INFO("%s: profiling %d tensors...\n", __func__, n_layer_all);
+        fprintf(stderr, "PROFILE: profiling %d layers...\n", n_layer_all);
         llama_tensor_profiler profiler;
 
         // For each layer, profile key tensors
@@ -1682,7 +1681,39 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 profiler.begin_op(format("blk.%d.ffn_up_shexp.weight", il), "MUL_MAT", dev, ggml_nbytes(layer.ffn_up_shexp));
                 profiler.end_op(format("blk.%d.ffn_up_shexp.weight", il));
             }
+
+            // Profile standard dense model tensors (LLaMA, Qwen, etc.)
+            if (layer.wq) {
+                profiler.begin_op(format("blk.%d.wq.weight", il), "MUL_MAT", dev, ggml_nbytes(layer.wq));
+                profiler.end_op(format("blk.%d.wq.weight", il));
+            }
+            if (layer.wk) {
+                profiler.begin_op(format("blk.%d.wk.weight", il), "MUL_MAT", dev, ggml_nbytes(layer.wk));
+                profiler.end_op(format("blk.%d.wk.weight", il));
+            }
+            if (layer.wv) {
+                profiler.begin_op(format("blk.%d.wv.weight", il), "MUL_MAT", dev, ggml_nbytes(layer.wv));
+                profiler.end_op(format("blk.%d.wv.weight", il));
+            }
+            if (layer.wo) {
+                profiler.begin_op(format("blk.%d.wo.weight", il), "MUL_MAT", dev, ggml_nbytes(layer.wo));
+                profiler.end_op(format("blk.%d.wo.weight", il));
+            }
+            if (layer.ffn_gate) {
+                profiler.begin_op(format("blk.%d.ffn_gate.weight", il), "MUL_MAT", dev, ggml_nbytes(layer.ffn_gate));
+                profiler.end_op(format("blk.%d.ffn_gate.weight", il));
+            }
+            if (layer.ffn_down) {
+                profiler.begin_op(format("blk.%d.ffn_down.weight", il), "MUL_MAT", dev, ggml_nbytes(layer.ffn_down));
+                profiler.end_op(format("blk.%d.ffn_down.weight", il));
+            }
+            if (layer.ffn_up) {
+                profiler.begin_op(format("blk.%d.ffn_up.weight", il), "MUL_MAT", dev, ggml_nbytes(layer.ffn_up));
+                profiler.end_op(format("blk.%d.ffn_up.weight", il));
+            }
         }
+
+        fprintf(stderr, "PROFILE: loop done, profiling %d layers complete\n", n_layer_all);
 
         profiler.calculate_epd();
         profiler.print_report();
@@ -1697,12 +1728,26 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             vram_free += free;
         }
         double budget = 0.85 * vram_free;
-        auto solution = profiler.solve_knapsack(budget, 12.0); // PCIe 3.0 x16 ≈ 12 GB/s
+        fprintf(stderr, "PROFILE: knapsack budget=%.0f MB (VRAM free=%.0f MB)\n",
+                budget / (1024.0*1024.0), vram_free / (1024.0*1024.0));
+        auto solution = profiler.solve_knapsack(budget, 12.0);
 
-        LLAMA_LOG_INFO("%s: knapsack solution: %zu GPU tensors (%.0f MB), benefit %.2f ms\n",
-                       __func__, solution.gpu_tensors.size(),
-                       solution.total_size / (1024.0 * 1024.0),
-                       solution.total_benefit);
+        fprintf(stderr, "PROFILE: knapsack solution: %zu GPU tensors (%.0f MB), benefit %.2f ms\n",
+                solution.gpu_tensors.size(),
+                solution.total_size / (1024.0 * 1024.0),
+                solution.total_benefit);
+
+        // Print tensor-level placement as --override-tensor commands
+        if (solution.gpu_tensors.size() > 0) {
+            fprintf(stderr, "PROFILE: tensor-level placement overrides (--override-tensor):\n");
+            auto overrides = profiler.generate_overrides(solution);
+            for (size_t i = 0; i < std::min(overrides.size(), size_t(20)); i++) {
+                fprintf(stderr, "  %s\n", overrides[i].c_str());
+            }
+            if (overrides.size() > 20) {
+                LLAMA_LOG_INFO("  ... (%zu more)\n", overrides.size() - 20);
+            }
+        }
     }
 
     // load tensor data
