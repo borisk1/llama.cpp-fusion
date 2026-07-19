@@ -21,13 +21,75 @@ A fork of [llama.cpp](https://github.com/ggml-org/llama.cpp) focused on advanced
 ## Features
 
 ### 🧵 Thread Copy (TC)
-NUMA-aware multi-group CPU execution for dual-Xeon / multi-socket systems.
+NUMA-aware multi-group CPU execution for dual-Xeon / multi-socket systems. The core idea: split CPU threads into independent groups, each processing a separate pipeline stage with NUMA-local memory access.
 
 ```
+--thread-copy <group1>[,<group2>,<group3>,...]
+```
+
+**How the numbers work:**
+
+Each group is a comma-separated list of CPU core ranges. The groups process different pipeline stages in parallel. Memory allocated by a group stays local to its NUMA node.
+
+```
+# 2 groups, both on NUMA node 0 (cores 0-11)
 --thread-copy 0-5,6-11
+#   ^--- group 0: cores 0-5
+#             ^--- group 1: cores 6-11
+
+# 2 groups, cross-socket (NUMA node 0 + NUMA node 1)
+--thread-copy 0-5,24-29
+#   ^--- group 0 on socket 0 (cores 0-5)
+#             ^--- group 1 on socket 1 (cores 24-29)
+
+# 4 groups, 2 per socket
+--thread-copy 0-2,3-5,24-26,27-29
 ```
 
-Splits CPU threads into groups — each group drives a separate pipeline stage. Up to +30% on multi-socket vs. vanilla threadpool. Ported from the DeepSeek-thread fork.
+**How to pick the right numbers:**
+
+1. Check your NUMA topology:
+```bash
+numactl --hardware
+# Example output on dual Xeon:
+# node 0 cpus: 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23
+# node 1 cpus: 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47
+```
+
+2. Pick cores from the **same NUMA node** for each group, and pin with `numactl`:
+
+```bash
+# 2 groups, same socket (node 0)
+numactl --cpunodebind=0 --membind=0 \
+  ./build/bin/llama-server ... --thread-copy 0-5,6-11
+
+# 2 groups, cross-socket (node 0 + node 1)
+numactl --cpunodebind=0 --membind=0 \
+  ./build/bin/llama-server ... --thread-copy 0-5,24-29
+
+# 4 groups, spread across both sockets
+numactl --cpunodebind=0 --membind=0 \
+  ./build/bin/llama-server ... --thread-copy 0-2,3-5,24-26,27-29
+```
+
+**Why it matters on dual Xeon:**
+
+On a dual-socket system, memory access patterns dominate decode performance. When a thread on socket 1 reads model weights allocated on socket 0's DRAM, it crosses the UPI/QPI interconnect — adding 100-200 ns latency per access. For a 79 GB model streamed token-by-token, this overhead adds up.
+
+Thread Copy ensures:
+- Each group processes a contiguous pipeline stage with NUMA-local memory
+- Cross-socket transfers only happen between pipeline stages, not within them
+- Book-keeping overhead (plan/dispatch/collision) is isolated per-group
+
+**Results (DSV4 Flash, 1× RTX 3090):**
+- Baseline (single thread pool, 24 threads): 6.37 t/s
+- Same-socket TC (12 threads, 2 groups): 6.89 t/s (+8%)
+- Cross-socket TC (24 threads, 2 groups): 6.6-6.8 t/s (+4-7%)
+
+**When NOT to use:**
+- Single-socket systems (no NUMA benefit)
+- Systems with few cores (dividing into groups reduces per-group parallelism)
+- GPU-only inference (no CPU compute to accelerate)
 
 ### 🎯 MoE Cache (leloch)
 GPU-based expert weight cache that dramatically reduces CPU→GPU transfers for MoE models. Works with all MoE architectures.
