@@ -164,60 +164,37 @@ double llama_tensor_profiler::measure_tensor_on_backend(
         return t;
     }
 
-    // NOTE: Direct graph execution with ggml_backend is currently unstable for
-    // cross-context tensors (weight tensors from model context vs profiling context).
-    // ggml_backend_alloc_ctx_tensors crashes because it tries to re-allocate weight
-    // tensors. ggml_backend_sched is more sophisticated but requires careful
-    // backend/buft array setup which is fragile.
+    // NOTE: Real GPU measurement via ggml_backend_sched is currently blocked by
+    // internal assertions in ggml_gallocr_reserve_n when handling cross-context
+    // tensor references (view tensors from model context). This requires deeper
+    // ggml backend changes.
     //
-    // For now, use bandwidth-based estimation which is fast, stable, and gives
-    // meaningful relative timings for the knapsack solver.
-    //
-    // Future work (perf-cuda-events branch):
-    // - Use CUDA events directly around existing kernel launches
-    // - Or fix the scheduler backend/buft array configuration
+    // For now, use bandwidth-based estimation which is stable and gives meaningful
+    // relative timings for the knapsack solver.
     auto * dev = ggml_backend_get_device(backend);
     if (!dev) return 0.0;
-    size_t total = 0, free = 0;
-    ggml_backend_dev_memory(dev, &free, &total);
-
-    double bw_gbs = 100.0;
-    double compute_ratio = 1.0;
-    auto dev_type = ggml_backend_dev_type(dev);
-    if (dev_type == GGML_BACKEND_DEVICE_TYPE_ACCEL) {
-        double vram_gb = total / 1e9;
-        bw_gbs = vram_gb * 15.0;
-        bw_gbs = std::min(bw_gbs, 2000.0);
-        compute_ratio = 20.0;
-    } else {
-        bw_gbs = 40.0;
-        compute_ratio = 1.0;
-    }
-
-    double time_ms = 0.0;
+    size_t total_ram = 0, free_ram = 0;
+    ggml_backend_dev_memory(dev, &free_ram, &total_ram);
+    double bw = 100.0;
+    double cr = 1.0;
+    auto dt = ggml_backend_dev_type(dev);
+    if (dt == GGML_BACKEND_DEVICE_TYPE_ACCEL) {
+        double v = total_ram / 1e9;
+        bw = std::min(v * 15.0, 2000.0); cr = 20.0;
+    } else { bw = 40.0; cr = 1.0; }
+    double t = 0;
     if (op_type == "MUL_MAT" || op_type == "MUL_MAT_ID") {
-        double bytes_per_op = 2.0 * nbytes;
-        double bw_bytes_per_ms = bw_gbs * 1e9 / 1000.0;
-        double mem_time = bytes_per_op / bw_bytes_per_ms;
-        double compute_time = mem_time / compute_ratio;
-        time_ms = mem_time + compute_time;
-        time_ms += (dev_type == GGML_BACKEND_DEVICE_TYPE_ACCEL) ? 0.02 : 0.2;
+        double b = 2.0 * nbytes, m = b / (bw * 1e9 / 1000.0);
+        t = m + m/cr + (dt == GGML_BACKEND_DEVICE_TYPE_ACCEL ? 0.02 : 0.2);
     } else if (op_type == "RMS_NORM") {
-        double nelements = (double)ggml_nelements(tensor);
-        double bytes = nelements * sizeof(float);
-        double bw_bytes_per_ms = bw_gbs * 1e9 / 1000.0;
-        time_ms = bytes / bw_bytes_per_ms;
-        time_ms /= (1.0 + 0.5 * (compute_ratio - 1.0));
-        time_ms = std::max(time_ms, 0.001);
+        double e = (double)ggml_nelements(tensor) * sizeof(float);
+        t = e / (bw * 1e9 / 1000.0) / (1.0 + 0.5*(cr-1.0));
     }
-
-    time_ms = std::max(time_ms, 0.001);
-
-    fprintf(stderr, "measure: %s %s = %.4f ms (est, size=%.0f MB, bw=%.0f GB/s)\n",
-            op_type.c_str(), tensor_name.c_str(), time_ms,
-            nbytes / (1024.0 * 1024.0), bw_gbs);
-
-    return time_ms;
+    t = std::max(t, 0.001);
+    fprintf(stderr, "measure: %s %s = %.4f ms (est, %.0f MB, %.0f GB/s)\n",
+            op_type.c_str(), tensor_name.c_str(), t,
+            nbytes/(1024.0*1024.0), bw);
+    return t;
 }
 
 void llama_tensor_profiler::record_measurement(
