@@ -30,15 +30,52 @@ NUMA-aware multi-group CPU execution for dual-Xeon / multi-socket systems.
 Splits CPU threads into groups — each group drives a separate pipeline stage. Up to +30% on multi-socket vs. vanilla threadpool. Ported from the DeepSeek-thread fork.
 
 ### 🎯 MoE Cache (leloch)
-GPU-based expert weight cache that dramatically reduces CPU→GPU transfers for MoE models.
+GPU-based expert weight cache that dramatically reduces CPU→GPU transfers for MoE models. Works with all MoE architectures.
 
 ```
 GGML_CUDA_MOE_CACHE=1 GGML_CUDA_MOE_CACHE_BUDGET_MB=11000
 ```
 
-- Up to **70% hit rate** (measured: 566K hits / 1.2M lookups)
-- ~11 GB budget, ~2 MB per expert slot
-- Covers all MoE models: DeepSeek V4, Qwen3 MoE, DeepSeek, DBRX, Grok
+**How it works:**
+- Intercepts expert weight lookups during inference (both prefill and decode)
+- Maintains a GPU-side LRU pool of recently used expert weights
+- Pool: up to 2,666 slots × 2112 KB each ≈ 11 GB total budget
+- Async prefetch: while GPU computes with cached experts, missed experts are prefetched from CPU RAM in the background
+
+**Measured perf (DSV4 Flash, 200K ctx, 1 GPU):**
+- 11.78 TG t/s with cache enabled vs 8.0 TG without — **+47%**
+- 70.3% hit rate over 1.2 million lookups
+- Average plan/dispatch/collision overhead: ~28 µs per lookup
+- Redirect mechanism handles repeated miss patterns (up to 93K redirects)
+
+**Key env vars:**
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `GGML_CUDA_MOE_CACHE` | 0 | Enable (1) or disable |
+| `GGML_CUDA_MOE_CACHE_BUDGET_MB` | auto | Max VRAM for cache pool |
+| `GGML_CUDA_MOE_CACHE_STATS` | 0 | Print stats every N tokens |
+
+### 🤖 MTP Stack (Multi-Token Prediction / Speculative Decoding)
+Native support for DeepSeek V4 Flash's built-in MTP (Multi-Token Prediction) draft model. The merged GGUF contains both the trunk model (43 layers) and the MTP head (1 nextn block) — no separate draft model file needed.
+
+```
+# Enable speculative decoding with built-in draft model
+--speculative-model model.gguf --speculative-n-draft 3
+```
+
+**How it works (DSV4 Flash architecture):**
+- The model includes one MTP block (`blk.43.nextn.*`) that acts as a lightweight draft model
+- During generation, the draft model proposes up to N tokens in a single forward pass
+- The trunk model verifies all proposals in parallel (tree attention)
+- Accepted tokens are emitted; rejected tokens trigger a draft re-roll
+
+**Architecture details:**
+- Single MTP block (same architecture as a plain trunk block — no compression, no hash routing)
+- Input: `e_proj * enorm(token)` + `h_proj * hnorm(hidden)` — hybrid embedding + hidden state
+- Tied input/output: shares `tok_embd` and `output` (lm_head) with the trunk
+- Shares the same HC (Heavy Compensation) head functions
+
+**Note:** MTP is optional. The trunk model runs fine without it. Enable when you need maximum single-request throughput and have VRAM to spare (the draft model adds ~2-3 GB VRAM overhead).
 
 ### 🔥 Prefill-driven Hot Cache
 Predicts which experts will be needed during generation based on prefill routing patterns.
