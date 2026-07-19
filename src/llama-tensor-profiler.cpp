@@ -144,9 +144,9 @@ std::vector<std::string> llama_tensor_profiler::generate_overrides(const placeme
 
 double llama_tensor_profiler::measure_tensor_on_backend(
         const std::string & tensor_name,
-        ggml_tensor * tensor,
-        ggml_backend_t backend,
-        const std::string & op_type) {
+                ggml_tensor * tensor,
+                ggml_backend_t backend,
+                const std::string & op_type) {
     if (!tensor || !backend) return 0.0;
 
     size_t nbytes = ggml_nbytes(tensor);
@@ -155,63 +155,43 @@ double llama_tensor_profiler::measure_tensor_on_backend(
     auto * dev = ggml_backend_get_device(backend);
     if (!dev) return 0.0;
 
-    // Estimate execution time based on tensor size and device bandwidth
-    // This avoids the complexity of building and running actual GGML graphs
-    // which can crash due to buffer management issues with pre-allocated weights.
-    //
-    // For attention weights (wq, wk, wv, wo):  MUL_MAT with [n_embd, n_embd] × [n_embd, 1]
-    // For MoE gate:                            MUL_MAT with [n_embd, n_embd] × [n_embd, 1]
-    // For RMS_NORM:                            Element-wise with n_embd elements
-    //
-    // Memory bandwidth model: time = bytes_transferred / effective_bandwidth
-
-    // Get device memory bandwidth estimate
+    // Estimate execution time based on tensor size and device bandwidth.
+    // This is reliable and avoids GPU buffer management issues.
     size_t total = 0, free = 0;
     ggml_backend_dev_memory(dev, &free, &total);
 
-    // Estimate effective bandwidth based on device type and total VRAM
-    double bw_gbs = 100.0; // default
-    double compute_ratio = 1.0; // compute throughput multiplier vs baseline
+    double bw_gbs = 100.0;
+    double compute_ratio = 1.0;
     auto dev_type = ggml_backend_dev_type(dev);
     if (dev_type == GGML_BACKEND_DEVICE_TYPE_ACCEL) {
-        // GPU: much higher BW and compute
         double vram_gb = total / 1e9;
-        bw_gbs = vram_gb * 15.0;  // e.g. 24 GB → ~360 GB/s effective
+        bw_gbs = vram_gb * 15.0;
         bw_gbs = std::min(bw_gbs, 2000.0);
-        compute_ratio = 20.0; // GPU ~20× faster compute than CPU
+        compute_ratio = 20.0;
     } else {
-        // CPU: lower BW, lower compute
-        bw_gbs = 40.0; // typical dual-channel DDR4
+        bw_gbs = 40.0;
         compute_ratio = 1.0;
     }
 
     double time_ms = 0.0;
-
     if (op_type == "MUL_MAT" || op_type == "MUL_MAT_ID") {
-        // MUL_MAT: data movement + compute
         double bytes_per_op = 2.0 * nbytes;
         double bw_bytes_per_ms = bw_gbs * 1e9 / 1000.0;
         double mem_time = bytes_per_op / bw_bytes_per_ms;
-        double compute_time = mem_time / compute_ratio; // compute is faster on GPU
+        double compute_time = mem_time / compute_ratio;
         time_ms = mem_time + compute_time;
-
-        // Add constant overhead for kernel launch (smaller for GPU)
         time_ms += (dev_type == GGML_BACKEND_DEVICE_TYPE_ACCEL) ? 0.02 : 0.2;
     } else if (op_type == "RMS_NORM") {
-        // RMS_NORM: memory-bound, less compute advantage for GPU
         double nelements = (double)ggml_nelements(tensor);
         double bytes = nelements * sizeof(float);
         double bw_bytes_per_ms = bw_gbs * 1e9 / 1000.0;
         time_ms = bytes / bw_bytes_per_ms;
-        // RMS_NORM has some compute too, small GPU advantage
-        time_ms /= (1.0 + 0.5 * (compute_ratio - 1.0)); // partial GPU speedup
+        time_ms /= (1.0 + 0.5 * (compute_ratio - 1.0));
         time_ms = std::max(time_ms, 0.001);
     }
 
-    // Set a minimum measurement time for stability
     time_ms = std::max(time_ms, 0.001);
 
-    // For large expert tensors, the estimate is more meaningful than for small ones
     fprintf(stderr, "measure: %s %s = %.4f ms (est, size=%.0f MB, bw=%.0f GB/s)\n",
             op_type.c_str(), tensor_name.c_str(), time_ms,
             nbytes / (1024.0 * 1024.0), bw_gbs);
