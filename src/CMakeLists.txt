@@ -39,6 +39,7 @@ add_library(llama
             llama-quant.cpp
             llama-sampler.cpp
             llama-tensor-profiler.cpp
+            llama-dynamic-transfer.cpp
             llama-vocab.cpp
             unicode-data.cpp
             unicode.cpp

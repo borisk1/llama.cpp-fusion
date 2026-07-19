@@ -55,6 +55,10 @@ public:
     // Print profiling report
     void print_report() const;
 
+    // Generate tensor buffer type overrides from knapsack solution
+    // Returns override commands that can be passed to --override-tensor
+    std::vector<std::string> generate_overrides(const placement_solution & solution) const;
+
     // Get top N tensors by benefit/size ratio for GPU placement
     std::vector<std::string> get_top_tensors(int n, double vram_budget_bytes) const;
 
