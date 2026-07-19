@@ -258,10 +258,11 @@ llama_tensor_profiler::placement_solution llama_tensor_profiler::solve_knapsack(
     // Build list of items for knapsack
     struct item {
         std::string name;
-        double      benefit;    // r_i = t_cpu - t_gpu (time saved)
-        size_t      size;       // s_i (memory footprint)
+        double      benefit;
+        size_t      size;
         double      benefit_per_byte;
-        int         group;      // layer index for switching cost
+        int         layer;
+        std::string op_type;
     };
 
     if (entries.empty()) {
@@ -269,60 +270,125 @@ llama_tensor_profiler::placement_solution llama_tensor_profiler::solve_knapsack(
         return {};
     }
 
-    std::vector<item> items;
+    // Group entries by layer
+    std::unordered_map<int, std::vector<const tensor_profile_entry*>> by_layer;
+    int max_layer = 0;
     for (const auto & [name, entry] : entries) {
         if (entry.count == 0 || entry.size == 0) continue;
-        items.push_back({
-            entry.name,
-            entry.benefit,
-            entry.size,
-            entry.benefit / entry.size,
-            entry.layer
-        });
+        int l = entry.layer;
+        if (l < 0) continue; // skip unlayered tensors
+        by_layer[l].push_back(&entry);
+        max_layer = std::max(max_layer, l);
     }
 
-    // Sort by benefit-per-byte descending (greedy knapsack for large N)
-    std::sort(items.begin(), items.end(), [](const item & a, const item & b) {
-        return a.benefit_per_byte > b.benefit_per_byte;
+    // For each layer, compute total benefit, size, and priority
+    // Priority = benefit / size * layer_depth_factor
+    // where layer_depth_factor = 1 + (max_layer - l) / max_layer  (0..2× boost)
+    // This gives earlier layers up to 2× priority vs last layer
+    struct layer_item {
+        int    layer_id;
+        double total_benefit;
+        size_t total_size;
+        double priority;
+        std::vector<const tensor_profile_entry*> tensors;
+    };
+
+    std::vector<layer_item> layers;
+    for (auto & [l, tensors] : by_layer) {
+        double benefit = 0;
+        size_t size = 0;
+        for (auto * t : tensors) {
+            benefit += t->benefit;
+            size    += t->size;
+        }
+        // Layer depth factor: earlier layers get higher priority
+        double depth_factor = 1.0;
+        int layer_count = max_layer + 1;
+        if (layer_count > 0) {
+            // Linear boost: layer 0 gets ~2×, last layer gets 1×
+            depth_factor = 1.0 + (double)(layer_count - 1 - l) / layer_count;
+        }
+        double priority = (size > 0) ? (benefit / size) * depth_factor : 0;
+        layers.push_back({l, benefit, size, priority, tensors});
+    }
+
+    // Sort layers by priority descending
+    std::sort(layers.begin(), layers.end(), [](const layer_item & a, const layer_item & b) {
+        return a.priority > b.priority;
     });
 
-    // Greedy selection within budget
+    // Re-order: create a per-tensor list sorted by layer priority first,
+    // then within each layer by individual benefit_per_byte.
+    // This way, all tensors from high-priority layers come first.
+    std::vector<const tensor_profile_entry*> sorted_all;
+    for (const auto & layer : layers) {
+        std::vector<const tensor_profile_entry*> layer_tensors = layer.tensors;
+        std::sort(layer_tensors.begin(), layer_tensors.end(),
+            [](const tensor_profile_entry * a, const tensor_profile_entry * b) {
+                return (a->benefit / a->size) > (b->benefit / b->size);
+            });
+        for (auto * t : layer_tensors) {
+            sorted_all.push_back(t);
+        }
+    }
+
+    // Greedy selection within budget (from sorted_all)
     placement_solution result;
     result.total_benefit = 0;
     result.total_size = 0;
+    size_t used = 0;
 
-    for (const auto & it : items) {
-        if (result.total_size + it.size > vram_budget_bytes) continue;
-        result.gpu_tensors.push_back(it.name);
-        result.total_benefit += it.benefit;
-        result.total_size += it.size;
+    // First pass: try to place COMPLETE layers (for minimum switching)
+    for (const auto & layer : layers) {
+        if (used + layer.total_size > vram_budget_bytes) continue;
+        for (auto * t : layer.tensors) {
+            result.gpu_tensors.push_back(t->name);
+        }
+        result.total_benefit += layer.total_benefit;
+        result.total_size += layer.total_size;
+        used += layer.total_size;
+    }
+
+    // Second pass: fill remaining VRAM with individual high-benefit tensors
+    // from layers that didn't fit completely
+    for (const auto * t : sorted_all) {
+        // Skip if already placed
+        if (std::find(result.gpu_tensors.begin(), result.gpu_tensors.end(), t->name) != result.gpu_tensors.end()) {
+            continue;
+        }
+        if (used + t->size > vram_budget_bytes) continue;
+        result.gpu_tensors.push_back(t->name);
+        result.total_benefit += t->benefit;
+        result.total_size += t->size;
+        used += t->size;
     }
 
     // Build CPU list (everything not in GPU list)
-    for (const auto & it : items) {
-        if (std::find(result.gpu_tensors.begin(), result.gpu_tensors.end(), it.name) == result.gpu_tensors.end()) {
-            result.cpu_tensors.push_back(it.name);
+    for (const auto & [name, entry] : entries) {
+        if (entry.count == 0 || entry.size == 0) continue;
+        if (std::find(result.gpu_tensors.begin(), result.gpu_tensors.end(), name) == result.gpu_tensors.end()) {
+            result.cpu_tensors.push_back(name);
         }
     }
 
     // Apply switching cost penalty
-    // When adjacent tensors in the computation graph are on different backends,
-    // we incur a switching cost = input_size / PCIe_BW
-    // For simplicity, estimate switching cost based on layer transitions
     int switches = 0;
-    for (size_t i = 1; i < items.size(); i++) {
-        bool prev_gpu = std::find(result.gpu_tensors.begin(), result.gpu_tensors.end(), items[i-1].name) != result.gpu_tensors.end();
-        bool curr_gpu = std::find(result.gpu_tensors.begin(), result.gpu_tensors.end(), items[i].name) != result.gpu_tensors.end();
-        if (prev_gpu != curr_gpu && items[i-1].group != items[i].group) {
-            switches++;
+    for (size_t i = 1; i < result.gpu_tensors.size(); i++) {
+        int l1 = -1, l2 = -1;
+        auto it1 = entries.find(result.gpu_tensors[i-1]);
+        auto it2 = entries.find(result.gpu_tensors[i]);
+        if (it1 != entries.end() && it2 != entries.end()) {
+            l1 = it1->second.layer;
+            l2 = it2->second.layer;
         }
+        if (l1 != l2) switches++;
     }
 
     double switching_penalty = switches * 0.001; // ~1ms per switch
     result.total_benefit -= switching_penalty;
 
     fprintf(stderr, "knapsack: selected %zu GPU tensors (%.0f MB, benefit %.2f ms, %d switches)\n",
-                   result.gpu_tensors.size(), result.total_size / (1024*1024),
+                   result.gpu_tensors.size(), result.total_size / (1024.0*1024.0),
                    result.total_benefit, switches);
 
     return result;
