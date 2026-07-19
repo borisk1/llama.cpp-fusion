@@ -144,9 +144,9 @@ std::vector<std::string> llama_tensor_profiler::generate_overrides(const placeme
 
 double llama_tensor_profiler::measure_tensor_on_backend(
         const std::string & tensor_name,
-                ggml_tensor * tensor,
-                ggml_backend_t backend,
-                const std::string & op_type) {
+        ggml_tensor * tensor,
+        ggml_backend_t backend,
+        const std::string & op_type) {
     if (!tensor || !backend) return 0.0;
 
     size_t nbytes = ggml_nbytes(tensor);
@@ -156,7 +156,20 @@ double llama_tensor_profiler::measure_tensor_on_backend(
     if (!dev) return 0.0;
 
     // Estimate execution time based on tensor size and device bandwidth.
-    // This is reliable and avoids GPU buffer management issues.
+    // We use estimation instead of actual graph execution because:
+    //   1. ggml_backend_alloc_ctx_tensors cannot handle cross-context tensor references
+    //      (weight tensors are in the model context, not the profiling context)
+    //   2. Creating copies of weight tensors causes GPU memory pressure and crashes
+    //      after multiple allocations/frees on large models
+    //   3. Estimation gives meaningful relative timings for EPD comparison
+    //
+    // The bandwidth model accounts for:
+    //   - GPU vs CPU bandwidth (VRAM size × heuristic factor)
+    //   - Compute ratio (GPU ~20× faster for MUL_MAT)
+    //   - Operation type (MUL_MAT vs RMS_NORM vs MUL_MAT_ID)
+    //
+    // Future fix: use ggml_backend_sched instead of raw alloc_ctx_tensors,
+    // or use the backend's built-in CUDA event profiling during actual inference.
     size_t total = 0, free = 0;
     ggml_backend_dev_memory(dev, &free, &total);
 
