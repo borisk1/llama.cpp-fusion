@@ -597,6 +597,7 @@ struct common_params {
     bool no_extra_bufts    = false; // disable extra buffer types (used for weight repacking)
     bool no_host           = false; // bypass host buffer allowing extra buffers to be used
     bool profile_tensors   = false; // profile per-tensor CPU/GPU performance
+    bool auto_placement    = false; // automatically apply optimal tensor placement
 
     bool single_turn       = false; // single turn chat conversation
 

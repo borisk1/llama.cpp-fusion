@@ -329,6 +329,7 @@ extern "C" {
         bool no_host;         // bypass host buffer allowing extra buffers to be used
         bool no_alloc;        // only load metadata and simulate memory allocations
         bool profile_tensors; // [EXPERIMENTAL] profile per-tensor CPU/GPU performance
+        bool auto_placement;  // [EXPERIMENTAL] automatically apply optimal tensor placement
     };
 
     struct llama_sampler_seq_config {

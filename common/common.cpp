@@ -1566,6 +1566,7 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.use_extra_bufts = !params.no_extra_bufts;
     mparams.no_host         = params.no_host;
     mparams.profile_tensors  = params.profile_tensors;
+    mparams.auto_placement   = params.auto_placement;
 
     if (params.kv_overrides.empty()) {
         mparams.kv_overrides = NULL;

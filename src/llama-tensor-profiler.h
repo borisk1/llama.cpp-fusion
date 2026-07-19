@@ -55,9 +55,20 @@ public:
     // Print profiling report
     void print_report() const;
 
+    // Record a measured tensor execution time
+    void record_measurement(const std::string & name, const std::string & op_type,
+                            size_t size, double t_cpu_ms, double t_gpu_ms);
+
     // Generate tensor buffer type overrides from knapsack solution
     // Returns override commands that can be passed to --override-tensor
     std::vector<std::string> generate_overrides(const placement_solution & solution) const;
+
+    // Measure tensor execution time on a specific backend
+    // Creates a minimal computation graph and runs it multiple times
+    double measure_tensor_on_backend(const std::string & tensor_name,
+                                     ggml_tensor * tensor,
+                                     ggml_backend_t backend,
+                                     const std::string & op_type);
 
     // Get top N tensors by benefit/size ratio for GPU placement
     std::vector<std::string> get_top_tensors(int n, double vram_budget_bytes) const;

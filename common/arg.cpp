@@ -2267,6 +2267,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_PROFILE_TENSORS"));
     add_opt(common_arg(
+        {"--auto-placement"},
+        "automatically apply optimal tensor placement from profiling (requires --profile-tensors)",
+        [](common_params & params) {
+            params.auto_placement = true;
+        }
+    ).set_env("LLAMA_ARG_AUTO_PLACEMENT"));
+    add_opt(common_arg(
         {"-ctk", "--cache-type-k"}, "TYPE",
         string_format(
             "KV cache data type for K\n"

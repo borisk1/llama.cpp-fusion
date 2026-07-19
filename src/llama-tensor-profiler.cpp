@@ -4,12 +4,19 @@
 #include <algorithm>
 #include <numeric>
 
-void llama_tensor_profiler::begin_op(const std::string & tensor_name, const std::string & op_type,
+void llama_tensor_profiler::begin_op(const std::string & tensor_name, const std::string & op_type, 
                                       ggml_backend_dev_t backend, size_t tensor_size) {
-    auto backend_type = ggml_backend_dev_type(backend);
+    // Create entries with a pending measurement
+    auto & entry = entries[tensor_name];
+    entry.name    = tensor_name;
+    entry.size    = tensor_size;
+    entry.op_type = op_type;
+    entry.count   = 1;
+
+    // Mark as pending (will be filled by measure_tensor_on_backend)
     active_timing timing;
     timing.start   = std::chrono::high_resolution_clock::now();
-    timing.is_cpu  = (backend_type == GGML_BACKEND_DEVICE_TYPE_CPU);
+    timing.is_cpu  = (backend && ggml_backend_dev_type(backend) == GGML_BACKEND_DEVICE_TYPE_CPU);
     timing.size    = tensor_size;
     timing.op_type = op_type;
     active[tensor_name] = timing;
@@ -133,6 +140,158 @@ std::vector<std::string> llama_tensor_profiler::generate_overrides(const placeme
                    overrides.size(), solution.gpu_tensors.size(),
                    solution.cpu_tensors.size());
     return overrides;
+}
+
+double llama_tensor_profiler::measure_tensor_on_backend(
+        const std::string & tensor_name,
+        ggml_tensor * tensor,
+        ggml_backend_t backend,
+        const std::string & op_type) {
+    if (!tensor || !backend) return 0.0;
+
+    size_t nbytes = ggml_nbytes(tensor);
+    if (nbytes == 0) return 0.0;
+
+    // Create a minimal ggml context for graph building
+    // We need enough memory for: weight (already allocated), dummy input, result
+    size_t ctx_size = 1024 * 1024 * 100; // 100 MB should be plenty
+    struct ggml_init_params gparams = {
+        /*.mem_size   =*/ ctx_size,
+        /*.mem_buffer =*/ NULL,
+        /*.no_alloc   =*/ true,
+    };
+    struct ggml_context * ctx = ggml_init(gparams);
+    if (!ctx) {
+        fprintf(stderr, "measure: failed to create ggml context for %s\n", tensor_name.c_str());
+        return 0.0;
+    }
+
+    // Build a minimal computation graph
+    struct ggml_tensor * input = NULL;
+    struct ggml_tensor * result = NULL;
+
+    if (op_type == "MUL_MAT" || op_type == "MUL_MAT_ID") {
+        // Create a dummy input tensor with shape [n_embd, 1]
+        int64_t n_embd = tensor->ne[0];
+        input = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_embd);
+        if (!input) {
+            ggml_free(ctx);
+            return 0.0;
+        }
+
+        // Create the MUL_MAT operation
+        if (op_type == "MUL_MAT_ID") {
+            // For MoE experts, use MUL_MAT_ID with a dummy expert index
+            result = ggml_mul_mat_id(ctx, tensor, input, 0);
+        } else {
+            result = ggml_mul_mat(ctx, tensor, input);
+        }
+    } else if (op_type == "RMS_NORM") {
+        // Create RMS_NORM
+        int64_t n_embd = tensor->ne[0];
+        input = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_embd);
+        if (!input) {
+            ggml_free(ctx);
+            return 0.0;
+        }
+        result = ggml_rms_norm(ctx, input, 1e-6f);
+    } else {
+        ggml_free(ctx);
+        return 0.0;
+    }
+
+    if (!result) {
+        ggml_free(ctx);
+        return 0.0;
+    }
+
+    // Build the graph
+    struct ggml_cgraph * gf = ggml_new_graph(ctx);
+    if (!gf) {
+        ggml_free(ctx);
+        return 0.0;
+    }
+    ggml_build_forward_expand(gf, result);
+
+    // Allocate backend buffer for the graph
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    if (!buf) {
+        // Try CPU fallback
+        auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+        if (cpu_dev) {
+            ggml_backend_t cpu_backend = ggml_backend_dev_init(cpu_dev, nullptr);
+            if (cpu_backend) {
+                buf = ggml_backend_alloc_ctx_tensors(ctx, cpu_backend);
+                if (!buf) {
+                    ggml_free(ctx);
+                    return 0.0;
+                }
+            }
+        }
+        if (!buf) {
+            ggml_free(ctx);
+            return 0.0;
+        }
+    }
+
+    // Fill input with simple data
+    if (input && input->data) {
+        float * data = (float *)input->data;
+        for (int64_t i = 0; i < ggml_nelements(input) && i < 128; i++) {
+            data[i] = 1.0f;
+        }
+    }
+
+    // Warmup run
+    ggml_backend_graph_compute(backend, gf);
+
+    // Timed run (multiple iterations for accuracy)
+    int n_iter = std::max(1, (int)(100000 / std::max(nbytes, (size_t)1)));
+    n_iter = std::min(n_iter, 1000);
+
+    auto t0 = std::chrono::high_resolution_clock::now();
+    for (int i = 0; i < n_iter; i++) {
+        ggml_backend_graph_compute(backend, gf);
+    }
+    auto t1 = std::chrono::high_resolution_clock::now();
+
+    // Cleanup
+    ggml_backend_buffer_free(buf);
+    ggml_free(ctx);
+
+    double total_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    double avg_ms = total_ms / n_iter;
+
+    fprintf(stderr, "measure: %s %s = %.4f ms (avg of %d runs, size=%.0f MB)\n",
+            op_type.c_str(), tensor_name.c_str(), avg_ms, n_iter,
+            nbytes / (1024.0 * 1024.0));
+
+    return avg_ms;
+}
+
+void llama_tensor_profiler::record_measurement(
+        const std::string & name, const std::string & op_type,
+        size_t size, double t_cpu_ms, double t_gpu_ms) {
+    auto & entry = entries[name];
+    entry.name    = name;
+    entry.size    = size;
+    entry.op_type = op_type;
+    entry.count   = 1;
+    entry.t_cpu   = t_cpu_ms;
+    entry.t_gpu   = t_gpu_ms;
+    entry.benefit = t_cpu_ms - t_gpu_ms;
+    if (size > 0) {
+        entry.epd_cpu = t_cpu_ms / size;
+        entry.epd_gpu = t_gpu_ms / size;
+    }
+    // Extract layer index
+    if (name.substr(0, 4) == "blk.") {
+        auto dot2 = name.find('.', 4);
+        if (dot2 != std::string::npos) {
+            try { entry.layer = std::stoi(name.substr(4, dot2 - 4)); }
+            catch (...) { entry.layer = -1; }
+        }
+    }
 }
 
 void llama_tensor_profiler::clear() {

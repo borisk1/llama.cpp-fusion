@@ -1617,100 +1617,72 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     if (profile_tensors) {
         fprintf(stderr, "PROFILE: profiling %d layers...\n", n_layer_all);
         llama_tensor_profiler profiler;
+        bool auto_placement = params.auto_placement;
 
         // For each layer, profile key tensors
         for (int il = 0; il < n_layer_all; ++il) {
             auto & layer = layers[il];
             auto * dev = pimpl->dev_layer[il].dev;
-            auto backend_type = ggml_backend_dev_type(dev);
+            if (!dev) continue;
 
-            // Profile attention tensors
-            if (layer.attn_norm) {
-                profiler.begin_op(format("blk.%d.attn_norm.weight", il), "RMS_NORM", dev, ggml_nbytes(layer.attn_norm));
-                profiler.end_op(format("blk.%d.attn_norm.weight", il));
-            }
-            if (layer.wq_a) {
-                profiler.begin_op(format("blk.%d.wq_a.weight", il), "MUL_MAT", dev, ggml_nbytes(layer.wq_a));
-                profiler.end_op(format("blk.%d.wq_a.weight", il));
-            }
-            if (layer.wq_b) {
-                profiler.begin_op(format("blk.%d.wq_b.weight", il), "MUL_MAT", dev, ggml_nbytes(layer.wq_b));
-                profiler.end_op(format("blk.%d.wq_b.weight", il));
-            }
-            if (layer.wkv) {
-                profiler.begin_op(format("blk.%d.wkv.weight", il), "MUL_MAT", dev, ggml_nbytes(layer.wkv));
-                profiler.end_op(format("blk.%d.wkv.weight", il));
-            }
-            if (layer.wo_a) {
-                profiler.begin_op(format("blk.%d.wo_a.weight", il), "MUL_MAT", dev, ggml_nbytes(layer.wo_a));
-                profiler.end_op(format("blk.%d.wo_a.weight", il));
-            }
-            if (layer.wo_b) {
-                profiler.begin_op(format("blk.%d.wo_b.weight", il), "MUL_MAT", dev, ggml_nbytes(layer.wo_b));
-                profiler.end_op(format("blk.%d.wo_b.weight", il));
-            }
+            // Get or create backend for this device
+            auto * backend = ggml_backend_dev_init(dev, nullptr);
+            if (!backend) continue;
 
-            // Profile FFN tensors (MoE)
-            if (layer.ffn_gate_inp) {
-                profiler.begin_op(format("blk.%d.ffn_gate_inp.weight", il), "MUL_MAT", dev, ggml_nbytes(layer.ffn_gate_inp));
-                profiler.end_op(format("blk.%d.ffn_gate_inp.weight", il));
-            }
-            if (layer.ffn_gate_exps) {
-                profiler.begin_op(format("blk.%d.ffn_gate_exps.weight", il), "MUL_MAT_ID", dev, ggml_nbytes(layer.ffn_gate_exps));
-                profiler.end_op(format("blk.%d.ffn_gate_exps.weight", il));
-            }
-            if (layer.ffn_down_exps) {
-                profiler.begin_op(format("blk.%d.ffn_down_exps.weight", il), "MUL_MAT_ID", dev, ggml_nbytes(layer.ffn_down_exps));
-                profiler.end_op(format("blk.%d.ffn_down_exps.weight", il));
-            }
-            if (layer.ffn_up_exps) {
-                profiler.begin_op(format("blk.%d.ffn_up_exps.weight", il), "MUL_MAT_ID", dev, ggml_nbytes(layer.ffn_up_exps));
-                profiler.end_op(format("blk.%d.ffn_up_exps.weight", il));
-            }
+            // Helper lambda: measure a tensor on its backend
+            auto measure = [&](ggml_tensor * t, const char * name, const std::string & op) {
+                if (!t) return;
+                double t_cpu = 0, t_gpu = 0;
 
-            // Profile shared experts
-            if (layer.ffn_gate_shexp) {
-                profiler.begin_op(format("blk.%d.ffn_gate_shexp.weight", il), "MUL_MAT", dev, ggml_nbytes(layer.ffn_gate_shexp));
-                profiler.end_op(format("blk.%d.ffn_gate_shexp.weight", il));
-            }
-            if (layer.ffn_down_shexp) {
-                profiler.begin_op(format("blk.%d.ffn_down_shexp.weight", il), "MUL_MAT", dev, ggml_nbytes(layer.ffn_down_shexp));
-                profiler.end_op(format("blk.%d.ffn_down_shexp.weight", il));
-            }
-            if (layer.ffn_up_shexp) {
-                profiler.begin_op(format("blk.%d.ffn_up_shexp.weight", il), "MUL_MAT", dev, ggml_nbytes(layer.ffn_up_shexp));
-                profiler.end_op(format("blk.%d.ffn_up_shexp.weight", il));
-            }
+                // Measure on GPU (or assigned backend)
+                auto * gpu_dev = dev;
+                auto * gpu_backend = backend;
+                if (gpu_backend) {
+                    t_gpu = profiler.measure_tensor_on_backend(
+                        format("blk.%d.%s", il, name), t, gpu_backend, op);
+                }
 
-            // Profile standard dense model tensors (LLaMA, Qwen, etc.)
-            if (layer.wq) {
-                profiler.begin_op(format("blk.%d.wq.weight", il), "MUL_MAT", dev, ggml_nbytes(layer.wq));
-                profiler.end_op(format("blk.%d.wq.weight", il));
-            }
-            if (layer.wk) {
-                profiler.begin_op(format("blk.%d.wk.weight", il), "MUL_MAT", dev, ggml_nbytes(layer.wk));
-                profiler.end_op(format("blk.%d.wk.weight", il));
-            }
-            if (layer.wv) {
-                profiler.begin_op(format("blk.%d.wv.weight", il), "MUL_MAT", dev, ggml_nbytes(layer.wv));
-                profiler.end_op(format("blk.%d.wv.weight", il));
-            }
-            if (layer.wo) {
-                profiler.begin_op(format("blk.%d.wo.weight", il), "MUL_MAT", dev, ggml_nbytes(layer.wo));
-                profiler.end_op(format("blk.%d.wo.weight", il));
-            }
-            if (layer.ffn_gate) {
-                profiler.begin_op(format("blk.%d.ffn_gate.weight", il), "MUL_MAT", dev, ggml_nbytes(layer.ffn_gate));
-                profiler.end_op(format("blk.%d.ffn_gate.weight", il));
-            }
-            if (layer.ffn_down) {
-                profiler.begin_op(format("blk.%d.ffn_down.weight", il), "MUL_MAT", dev, ggml_nbytes(layer.ffn_down));
-                profiler.end_op(format("blk.%d.ffn_down.weight", il));
-            }
-            if (layer.ffn_up) {
-                profiler.begin_op(format("blk.%d.ffn_up.weight", il), "MUL_MAT", dev, ggml_nbytes(layer.ffn_up));
-                profiler.end_op(format("blk.%d.ffn_up.weight", il));
-            }
+                // Measure on CPU for comparison
+                auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+                if (cpu_dev && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+                    auto * cpu_backend = ggml_backend_dev_init(cpu_dev, nullptr);
+                    if (cpu_backend) {
+                        t_cpu = profiler.measure_tensor_on_backend(
+                            format("blk.%d.%s", il, name), t, cpu_backend, op);
+                    }
+                } else {
+                    t_cpu = t_gpu; // already on CPU
+                }
+
+                // Record in profiler
+                profiler.record_measurement(
+                    format("blk.%d.%s", il, name),
+                    op, ggml_nbytes(t), t_cpu, t_gpu);
+            };
+
+            measure(layer.attn_norm, "attn_norm.weight", "RMS_NORM");
+            measure(layer.wq_a, "wq_a.weight", "MUL_MAT");
+            measure(layer.wq_b, "wq_b.weight", "MUL_MAT");
+            measure(layer.wkv, "wkv.weight", "MUL_MAT");
+            measure(layer.wo_a, "wo_a.weight", "MUL_MAT");
+            measure(layer.wo_b, "wo_b.weight", "MUL_MAT");
+            measure(layer.ffn_gate_inp, "ffn_gate_inp.weight", "MUL_MAT");
+            measure(layer.ffn_gate_exps, "ffn_gate_exps.weight", "MUL_MAT_ID");
+            measure(layer.ffn_down_exps, "ffn_down_exps.weight", "MUL_MAT_ID");
+            measure(layer.ffn_up_exps, "ffn_up_exps.weight", "MUL_MAT_ID");
+            measure(layer.ffn_gate_shexp, "ffn_gate_shexp.weight", "MUL_MAT");
+            measure(layer.ffn_down_shexp, "ffn_down_shexp.weight", "MUL_MAT");
+            measure(layer.ffn_up_shexp, "ffn_up_shexp.weight", "MUL_MAT");
+            measure(layer.wq, "wq.weight", "MUL_MAT");
+            measure(layer.wk, "wk.weight", "MUL_MAT");
+            measure(layer.wv, "wv.weight", "MUL_MAT");
+            measure(layer.wo, "wo.weight", "MUL_MAT");
+            measure(layer.ffn_gate, "ffn_gate.weight", "MUL_MAT");
+            measure(layer.ffn_down, "ffn_down.weight", "MUL_MAT");
+            measure(layer.ffn_up, "ffn_up.weight", "MUL_MAT");
+
+            // Free temporary backend
+            if (backend) ggml_backend_free(backend);
         }
 
         fprintf(stderr, "PROFILE: loop done, profiling %d layers complete\n", n_layer_all);
@@ -1719,8 +1691,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         profiler.print_report();
 
         // Solve knapsack with default VRAM budget (85% of available)
-        size_t vram_total = 0;
-        size_t vram_free = 0;
+        size_t vram_total = 0, vram_free = 0;
         for (const auto & dev : devices) {
             size_t total = 0, free = 0;
             ggml_backend_dev_memory(dev.dev, &free, &total);
@@ -1731,22 +1702,42 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         fprintf(stderr, "PROFILE: knapsack budget=%.0f MB (VRAM free=%.0f MB)\n",
                 budget / (1024.0*1024.0), vram_free / (1024.0*1024.0));
         auto solution = profiler.solve_knapsack(budget, 12.0);
-
         fprintf(stderr, "PROFILE: knapsack solution: %zu GPU tensors (%.0f MB), benefit %.2f ms\n",
                 solution.gpu_tensors.size(),
                 solution.total_size / (1024.0 * 1024.0),
                 solution.total_benefit);
 
-        // Print tensor-level placement as --override-tensor commands
-        if (solution.gpu_tensors.size() > 0) {
-            fprintf(stderr, "PROFILE: tensor-level placement overrides (--override-tensor):\n");
-            auto overrides = profiler.generate_overrides(solution);
+        // Generate placement overrides
+        auto overrides = profiler.generate_overrides(solution);
+
+        if (auto_placement && overrides.size() > 0) {
+            // Save placement to a temp file for re-use
+            const char * placement_file = "/tmp/llama_placement.cfg";
+            FILE * f = fopen(placement_file, "w");
+            if (f) {
+                int count = 0;
+                for (const auto & ov : overrides) {
+                    fprintf(f, "%s\n", ov.c_str());
+                    count++;
+                }
+                fclose(f);
+                fprintf(stderr, "PROFILE: auto-placement saved %d overrides to %s\n", count, placement_file);
+                fprintf(stderr, "PROFILE: restart with: --override-tensor \"$(cat %s | paste -sd,)\"\n", placement_file);
+            }
+        }
+
+        if (!auto_placement && overrides.size() > 0) {
+            fprintf(stderr, "PROFILE: recommended overrides (use with --override-tensor):\n");
+            std::string cmd_line;
             for (size_t i = 0; i < std::min(overrides.size(), size_t(20)); i++) {
                 fprintf(stderr, "  %s\n", overrides[i].c_str());
+                if (!cmd_line.empty()) cmd_line += ",";
+                cmd_line += overrides[i];
             }
             if (overrides.size() > 20) {
-                LLAMA_LOG_INFO("  ... (%zu more)\n", overrides.size() - 20);
+                fprintf(stderr, "  ... (%zu more)\n", overrides.size() - 20);
             }
+            fprintf(stderr, "\nPROFILE: full override string:\n  %s\n", cmd_line.c_str());
         }
     }
 
@@ -2462,6 +2453,7 @@ llama_model_params llama_model_default_params() {
         /*.no_host                     =*/ false,
         /*.no_alloc                    =*/ false,
         /*.profile_tensors             =*/ false,
+        /*.auto_placement              =*/ false,
     };
 
     return result;
