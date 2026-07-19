@@ -152,24 +152,32 @@ double llama_tensor_profiler::measure_tensor_on_backend(
     size_t nbytes = ggml_nbytes(tensor);
     if (nbytes == 0) return 0.0;
 
+    // For tensors > 64 MB, use estimation to avoid GPU memory pressure
+    if (nbytes > 64ULL * 1024ULL * 1024ULL) {
+        auto * dev = ggml_backend_get_device(backend);
+        size_t total = 0, free = 0;
+        ggml_backend_dev_memory(dev, &free, &total);
+        double bw = std::min((total / 1e9) * 15.0, 2000.0);
+        double t = (2.0 * nbytes) / (bw * 1e9 / 1000.0);
+        fprintf(stderr, "measure: %s %s = %.4f ms (est, >64MB)\n",
+                op_type.c_str(), tensor_name.c_str(), t);
+        return t;
+    }
+
+    // NOTE: Direct graph execution with ggml_backend is currently unstable for
+    // cross-context tensors (weight tensors from model context vs profiling context).
+    // ggml_backend_alloc_ctx_tensors crashes because it tries to re-allocate weight
+    // tensors. ggml_backend_sched is more sophisticated but requires careful
+    // backend/buft array setup which is fragile.
+    //
+    // For now, use bandwidth-based estimation which is fast, stable, and gives
+    // meaningful relative timings for the knapsack solver.
+    //
+    // Future work (perf-cuda-events branch):
+    // - Use CUDA events directly around existing kernel launches
+    // - Or fix the scheduler backend/buft array configuration
     auto * dev = ggml_backend_get_device(backend);
     if (!dev) return 0.0;
-
-    // Estimate execution time based on tensor size and device bandwidth.
-    // We use estimation instead of actual graph execution because:
-    //   1. ggml_backend_alloc_ctx_tensors cannot handle cross-context tensor references
-    //      (weight tensors are in the model context, not the profiling context)
-    //   2. Creating copies of weight tensors causes GPU memory pressure and crashes
-    //      after multiple allocations/frees on large models
-    //   3. Estimation gives meaningful relative timings for EPD comparison
-    //
-    // The bandwidth model accounts for:
-    //   - GPU vs CPU bandwidth (VRAM size × heuristic factor)
-    //   - Compute ratio (GPU ~20× faster for MUL_MAT)
-    //   - Operation type (MUL_MAT vs RMS_NORM vs MUL_MAT_ID)
-    //
-    // Future fix: use ggml_backend_sched instead of raw alloc_ctx_tensors,
-    // or use the backend's built-in CUDA event profiling during actual inference.
     size_t total = 0, free = 0;
     ggml_backend_dev_memory(dev, &free, &total);
 

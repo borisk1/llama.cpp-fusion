@@ -1615,7 +1615,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     // tensor profiling (--profile-tensors)
     bool profile_tensors = params.profile_tensors;
     if (profile_tensors) {
-        fprintf(stderr, "PROFILE: profiling %d layers...\n", n_layer_all);
+        fprintf(stderr, "PROFILE: profiling %d layers with CUDA events...\n", n_layer_all);
         llama_tensor_profiler profiler;
         bool auto_placement = params.auto_placement;
 
