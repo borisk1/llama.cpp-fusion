@@ -29,7 +29,7 @@ GGML_CUDA_MOE_CACHE=1 GGML_CUDA_MOE_CACHE_BUDGET_MB=11000
 
 ## Benchmarks (DeepSeek V4 Flash IQ2_XXS, 79 GB)
 
-All tests on **dual Xeon Platinum 8160 (Skylake)** — 2x24 cores, 683 GB DDR4, **4x RTX 3090 via OCuLink**.
+All tests on **dual Xeon Platinum 8160 (Skylake)** — 2x24 cores, 768 GB DDR4, **4x RTX 3090 via OCuLink**.
 
 | Config | PP (t/s) | TG (t/s) |
 |--------|----------|----------|
