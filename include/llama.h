@@ -330,6 +330,8 @@ extern "C" {
         bool no_alloc;        // only load metadata and simulate memory allocations
         bool profile_tensors; // [EXPERIMENTAL] profile per-tensor CPU/GPU performance
         bool auto_placement;  // [EXPERIMENTAL] automatically apply optimal tensor placement
+        bool dynamic_transfer;// [EXPERIMENTAL] runtime dynamic CPU↔GPU tensor promotion
+        bool async_coord;     // [EXPERIMENTAL] async CPU-GPU coordination with CUDA streams
     };
 
     struct llama_sampler_seq_config {

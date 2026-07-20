@@ -13,6 +13,7 @@
 
 #include <map>
 #include <vector>
+#include <chrono>
 
 struct llama_model;
 class llama_batch_allocr;
@@ -54,6 +55,9 @@ struct llama_context {
     //   - changing attention type
     //   - etc.
     void sched_reserve();
+
+    void set_dynamic_transfer(bool enabled) { dynamic_transfer_enabled = enabled; }
+    void set_async_coord(bool enabled)      { async_coord_enabled = enabled; }
 
     void synchronize();
 
@@ -376,6 +380,15 @@ private:
 
     // env: LLAMA_GRAPH_REUSE_DISABLE
     bool graph_reuse_disable = false;
+
+    // Dynamic transfer runtime monitor
+    bool dynamic_transfer_enabled = false;
+    std::chrono::high_resolution_clock::time_point dt_last_step;
+    int  dt_step_count = 0;
+
+    // Async coordination
+    bool async_coord_enabled = false;
+    int  ac_step_count = 0;
 
     // perf
     mutable int64_t t_start_us  = 0;

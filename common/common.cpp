@@ -6,6 +6,7 @@
 #include "fit.h"
 #include "log.h"
 #include "llama.h"
+#include "../src/llama-context.h"
 #include "sampling.h"
 #include "speculative.h"
 #include "unicode.h"
@@ -1316,6 +1317,18 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         return;
     }
 
+    // Enable dynamic transfer if requested
+    if (params.dynamic_transfer) {
+        lctx->set_dynamic_transfer(true);
+        LLAMA_LOG_INFO("%s: dynamic transfer enabled\n", __func__);
+    }
+
+    // Enable async coordination if requested
+    if (params.async_coord) {
+        lctx->set_async_coord(true);
+        LLAMA_LOG_INFO("%s: async coordination enabled\n", __func__);
+    }
+
     pimpl->context.reset(lctx);
 }
 
@@ -1567,6 +1580,8 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.no_host         = params.no_host;
     mparams.profile_tensors  = params.profile_tensors;
     mparams.auto_placement   = params.auto_placement;
+    mparams.dynamic_transfer = params.dynamic_transfer;
+    mparams.async_coord      = params.async_coord;
 
     if (params.kv_overrides.empty()) {
         mparams.kv_overrides = NULL;

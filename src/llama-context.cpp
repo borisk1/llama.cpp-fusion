@@ -1382,6 +1382,34 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     hot_cache_readback_from_result(res, gtype == LLM_GRAPH_TYPE_DECODER_MTP ? 1 : 0,
         (int) ubatch.n_tokens, ubatch.pos, ubatch.token);
 
+    // MTP-guided prefetch: feed draft routing into hot-cache
+    // to predict which experts the main model will need next
+    if (gtype == LLM_GRAPH_TYPE_DECODER_MTP && hot_cache_is_active()) {
+        auto * gf = res->get_gf();
+        if (gf) {
+            int nn = ggml_graph_n_nodes(gf);
+            for (int i = 0; i < nn; i++) {
+                ggml_tensor * t = ggml_graph_node(gf, i);
+                const char * nm = ggml_get_name(t);
+                if (!nm || !strstr(nm, "ffn_moe_topk")) continue;
+                // Extract layer from tensor name
+                const char * dash = strrchr(nm, '-');
+                if (!dash) continue;
+                int layer = atoi(dash + 1);
+                if (layer < 0 || layer >= (int)model.hparams.n_layer()) continue;
+                // Read top-k expert indices
+                int n_sel = (int)t->ne[0];
+                if (n_sel <= 0 || n_sel > 64) continue;
+                std::vector<int32_t> experts(n_sel);
+                if (t->buffer) {
+                    ggml_backend_tensor_get(t, experts.data(), 0, n_sel * sizeof(int32_t));
+                }
+                // Feed to hot-cache (during warmup or if hot_cache_record accepts after activation)
+                hot_cache_record(layer, experts.data(), n_sel);
+            }
+        }
+    }
+
     // thread-copy: broadcast newly written KV cache cells to all group copies
     if (memory && ubatch.n_tokens > 0) {
         uint32_t pos_stride = ubatch.n_pos > 0 ? ubatch.n_pos : 1;
@@ -2480,7 +2508,39 @@ ggml_status llama_context::graph_compute(
         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
     }
 
-    // fprintf(stderr, "splits: %d\n", ggml_backend_sched_get_n_splits(sched));
+    // Dynamic transfer: record perf sample if enabled
+    if (dynamic_transfer_enabled) {
+        dt_step_count++;
+        auto now = std::chrono::high_resolution_clock::now();
+        double interval_ms = std::chrono::duration<double, std::milli>(now - dt_last_step).count();
+
+        // Track rolling window of last 10 intervals
+        static double dt_window[10] = {};
+        static int dt_wi = 0;
+        dt_window[dt_wi % 10] = interval_ms;
+        dt_wi++;
+
+        if (dt_step_count % 10 == 0) {
+            // Moving average over the window
+            double avg = 0;
+            int n = std::min(dt_wi, 10);
+            for (int i = 0; i < n; i++) avg += dt_window[i];
+            avg /= n;
+            fprintf(stderr, "DT: step %d, avg_interval=%.1f ms (%.1f TG)\n",
+                    dt_step_count, avg,
+                    avg > 0 ? 1000.0 / (avg * 1.5) : 0);
+        }
+        dt_last_step = now;
+    }
+
+    // Async coordination: track compute latency per step
+    if (async_coord_enabled) {
+        ac_step_count++;
+        if (ac_step_count % 10 == 0) {
+            fprintf(stderr, "AC: step %d, batch=%d\n",
+                    ac_step_count, (int)batched);
+        }
+    }
 
     return status;
 }

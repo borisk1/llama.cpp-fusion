@@ -3,6 +3,7 @@
 #include "llama-impl.h"
 #include <algorithm>
 #include <numeric>
+#include <cstring>
 
 void llama_tensor_profiler::begin_op(const std::string & tensor_name, const std::string & op_type, 
                                       ggml_backend_dev_t backend, size_t tensor_size) {
@@ -152,76 +153,121 @@ double llama_tensor_profiler::measure_tensor_on_backend(
     size_t nbytes = ggml_nbytes(tensor);
     if (nbytes == 0) return 0.0;
 
-    // For tensors > 64 MB, use estimation to avoid GPU memory pressure
-    if (nbytes > 64ULL * 1024ULL * 1024ULL) {
-        auto * dev = ggml_backend_get_device(backend);
+    // Check if real GPU measurement is feasible.
+    // Real measurement creates a weight copy on the GPU, which requires
+    // free VRAM. On multi-GPU setups with models loaded, VRAM is tight.
+    auto * dev = ggml_backend_get_device(backend);
+    bool use_real = false;
+    if (dev && nbytes <= 4ULL * 1024ULL * 1024ULL) {
         size_t total = 0, free = 0;
         ggml_backend_dev_memory(dev, &free, &total);
-        double bw = std::min((total / 1e9) * 15.0, 2000.0);
-        double t = (2.0 * nbytes) / (bw * 1e9 / 1000.0);
-        fprintf(stderr, "measure: %s %s = %.4f ms (est, >64MB)\n",
-                op_type.c_str(), tensor_name.c_str(), t);
-        return t;
+        use_real = (free > 512ULL * 1024ULL * 1024ULL);
     }
 
-    // NOTE: Real GPU measurement via ggml_backend_sched is blocked by internal
-    // assertions in ggml_gallocr_reserve_n. Use calibrated estimation instead.
-    //
-    // Calibration based on DSV4 Flash benchmark (4× RTX 3090):
-    //   - GPU MUL_MAT (34 MB):  ~1.2 ms    (measured during profiling)
-    //   - CPU MUL_MAT (34 MB):  ~24 ms     (estimated from  20× slowdown)
-    //   - GPU RMS_NORM (0 MB):  ~0.01 ms   (measured)
-    //   - CPU RMS_NORM (0 MB):  ~0.05 ms   (estimated from  5× slowdown)
-    //
-    // For any tensor, we estimate: t ∝ nbytes / effective_bw
-    // where effective_bw = device_memory_bw × utilization_factor
-    //
-    auto * dev = ggml_backend_get_device(backend);
+    if (!use_real) {
+        // Estimation fallback
+        if (dev) {
+            size_t total = 0, free = 0;
+            ggml_backend_dev_memory(dev, &free, &total);
+            double bw = std::min((total / 1e9) * 15.0, 2000.0);
+            double t = (2.0 * nbytes) / (bw * 1e9 / 1000.0);
+            fprintf(stderr, "measure: %s %s = %.4f ms (est, %.0f MB, %.0f GB/s)\n",
+                    op_type.c_str(), tensor_name.c_str(), t,
+                    nbytes / (1024.0 * 1024.0), bw);
+            return t;
+        }
+        return 0.0;
+    }
+
+    // Real GPU measurement via weight copy
+    // Creates a local copy of the weight tensor in our ggml context,
+    // avoiding cross-context issues with ggml_backend_alloc_ctx_tensors
     if (!dev) return 0.0;
-    size_t total_ram = 0, free_ram = 0;
-    ggml_backend_dev_memory(dev, &free_ram, &total_ram);
 
-    // Effective bandwidth and compute ratios from real benchmarks
-    double bw_gpu_gbs = 0.0, bw_cpu_gbs = 40.0;
-    double mulmat_ratio = 1.0, rmsnorm_ratio = 1.0;
+    struct ggml_init_params params = {
+        /*.mem_size   =*/ 1024 * 1024 * 128, // 128 MB
+        /*.mem_buffer =*/ NULL,
+        /*.no_alloc   =*/ true,
+    };
+    struct ggml_context * ctx = ggml_init(params);
+    if (!ctx) return 0.0;
 
-    auto dt = ggml_backend_dev_type(dev);
-    if (dt == GGML_BACKEND_DEVICE_TYPE_ACCEL) {
-        // GPU: RTX 3090实测bandwidth ~936 GB/s peak
-        double vram_gb = total_ram / 1e9;
-        bw_gpu_gbs = vram_gb * 13.0;  // ~312 GB/s effective
-        bw_gpu_gbs = std::min(bw_gpu_gbs, 1800.0);
-        mulmat_ratio = 1.0;   // baseline for GPU MUL_MAT
-        rmsnorm_ratio = 1.0;  // baseline for GPU RMS_NORM
-    } else {
-        // CPU: DDR4 bandwidth, 20× slower MUL_MAT, 5× slower RMS_NORM
-        bw_gpu_gbs = bw_cpu_gbs;
-        mulmat_ratio = 20.0;  // CPU is 20× slower for MUL_MAT
-        rmsnorm_ratio = 5.0;  // CPU is 5× slower for RMS_NORM
+    // Create a COPY of the weight in our context
+    struct ggml_tensor * wc = NULL;
+    int n3 = tensor->ne[3], n2 = tensor->ne[2], n1 = tensor->ne[1], n0 = tensor->ne[0];
+    int ndims = (n3>1?4:n2>1?3:n1>1?2:1);
+    switch (ndims) {
+        case 4: wc = ggml_new_tensor_4d(ctx, tensor->type, n0, n1, n2, n3); break;
+        case 3: wc = ggml_new_tensor_3d(ctx, tensor->type, n0, n1, n2); break;
+        case 2: wc = ggml_new_tensor_2d(ctx, tensor->type, n0, n1); break;
+        default: wc = ggml_new_tensor_1d(ctx, tensor->type, n0); break;
     }
+    if (!wc) { ggml_free(ctx); return 0.0; }
 
-    double t_ms = 0.0;
-    double bw_eff = bw_gpu_gbs;
-    double bw_bytes_per_ms = bw_eff * 1e9 / 1000.0;
-
+    // Build graph with local weight copy
+    struct ggml_tensor * inp = NULL, * res = NULL;
     if (op_type == "MUL_MAT" || op_type == "MUL_MAT_ID") {
-        double data_time = (2.0 * nbytes) / bw_bytes_per_ms;
-        double compute_time = data_time;
-        t_ms = (data_time + compute_time) * mulmat_ratio;
-        t_ms += (dt == GGML_BACKEND_DEVICE_TYPE_ACCEL) ? 0.02 : 0.20;
+        inp = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n0);
+        if (!inp) { ggml_free(ctx); return 0.0; }
+        res = ggml_mul_mat(ctx, wc, inp);
     } else if (op_type == "RMS_NORM") {
-        double bytes = (double)ggml_nelements(tensor) * sizeof(float);
-        t_ms = bytes / bw_bytes_per_ms * rmsnorm_ratio;
-        t_ms = std::max(t_ms, 0.001);
+        inp = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n0);
+        if (!inp) { ggml_free(ctx); return 0.0; }
+        res = ggml_rms_norm(ctx, inp, 1e-6f);
+    } else { ggml_free(ctx); return 0.0; }
+    if (!res) { ggml_free(ctx); return 0.0; }
+
+    struct ggml_cgraph * gf = ggml_new_graph(ctx);
+    if (!gf) { ggml_free(ctx); return 0.0; }
+    ggml_build_forward_expand(gf, res);
+
+    // Allocate ALL (weight copy + input + result) on the backend
+    // All tensors are local - no cross-context issues
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    if (!buf) {
+        ggml_free(ctx);
+        double bw = std::min(((double)(dev ? 24 : 0) * 13.0), 2000.0);
+        return (2.0 * nbytes) / (bw * 1e9 / 1000.0);
     }
 
-    t_ms = std::max(t_ms, 0.001);
+    // Copy weight data to our local copy (CPU/GPU via backend)
+    if (tensor->data && wc->data) {
+        auto dt = ggml_backend_dev_type(dev);
+        if (dt == GGML_BACKEND_DEVICE_TYPE_ACCEL) {
+            ggml_backend_tensor_copy(tensor, wc);
+            // Sync via graph compute with a trivial graph
+            struct ggml_cgraph * sync_gf = ggml_new_graph(ctx);
+            if (sync_gf) ggml_backend_graph_compute(backend, sync_gf);
+        } else {
+            std::memcpy(wc->data, tensor->data, nbytes);
+        }
+    }
 
-    fprintf(stderr, "measure: %s %s = %.4f ms (est, %.0f MB, bw=%.0f GB/s)\n",
-            op_type.c_str(), tensor_name.c_str(), t_ms,
-            nbytes / (1024.0 * 1024.0), bw_eff);
+    // Fill input
+    if (inp && inp->data) {
+        float * d = (float *)inp->data;
+        for (int64_t i = 0; i < ggml_nelements(inp) && i < 256; i++) d[i] = 1.0f;
+    }
 
-    return t_ms;
+    // Warmup + timed runs
+    ggml_backend_graph_compute(backend, gf);
+
+    int n_iter = std::max(1, std::min(30, (int)(10000 / std::max(nbytes, (size_t)1))));
+    auto t0 = std::chrono::high_resolution_clock::now();
+    for (int i = 0; i < n_iter; i++) {
+        ggml_backend_graph_compute(backend, gf);
+    }
+    auto t1 = std::chrono::high_resolution_clock::now();
+
+    ggml_backend_buffer_free(buf);
+    ggml_free(ctx);
+
+    double avg_ms = std::chrono::duration<double, std::milli>(t1 - t0).count() / n_iter;
+    fprintf(stderr, "measure: %s %s = %.4f ms (%d runs, %.0f MB)\n",
+            op_type.c_str(), tensor_name.c_str(), avg_ms, n_iter,
+            nbytes / (1024.0 * 1024.0));
+
+    return avg_ms;
 }
 
 void llama_tensor_profiler::record_measurement(

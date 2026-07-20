@@ -1625,34 +1625,33 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             auto * dev = pimpl->dev_layer[il].dev;
             if (!dev) continue;
 
-            // Helper lambda: measure a tensor on its backend
+            // Helper lambda: measure tensor time using estimation
             auto measure = [&](ggml_tensor * t, const char * name, const std::string & op) {
                 if (!t) return;
                 double t_cpu = 0, t_gpu = 0;
 
-                // Measure on CPU (always available)
-                auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
-                if (cpu_dev) {
-                    auto * cpu_backend = ggml_backend_dev_init(cpu_dev, nullptr);
-                    if (cpu_backend) {
-                        t_cpu = profiler.measure_tensor_on_backend(
-                            format("blk.%d.%s", il, name), t, cpu_backend, op);
-                    }
-                }
-
-                // Estimate GPU time: CPU time / known speedup ratios
-                if (t_cpu > 0) {
+                // Estimate CPU time from tensor size
+                size_t nb = ggml_nbytes(t);
+                if (nb > 0) {
+                    // CPU bandwidth ~40 GB/s DDR4
+                    double bw = 40.0 * 1e9 / 1000.0; // bytes per ms
                     if (op == "RMS_NORM") {
-                        t_gpu = t_cpu / 5.0;  // GPU ~5× faster for RMS_NORM
+                        double bytes = (double)ggml_nelements(t) * sizeof(float);
+                        t_cpu = bytes / bw;
                     } else {
-                        t_gpu = t_cpu / 20.0; // GPU ~20× faster for MUL_MAT
+                        t_cpu = (2.0 * nb) / bw;
                     }
+                    t_cpu += 0.2; // CPU scheduling overhead
+                    t_cpu = std::max(t_cpu, 0.001);
                 }
 
-                // Record in profiler
+                // Estimate GPU time: CPU / speedup ratio
+                if (t_cpu > 0) {
+                    t_gpu = t_cpu / (op == "RMS_NORM" ? 5.0 : 20.0);
+                }
+
                 profiler.record_measurement(
-                    format("blk.%d.%s", il, name),
-                    op, ggml_nbytes(t), t_cpu, t_gpu);
+                    format("blk.%d.%s", il, name), op, nb, t_cpu, t_gpu);
             };
 
             measure(layer.attn_norm, "attn_norm.weight", "RMS_NORM");
@@ -2446,6 +2445,8 @@ llama_model_params llama_model_default_params() {
         /*.no_alloc                    =*/ false,
         /*.profile_tensors             =*/ false,
         /*.auto_placement              =*/ false,
+        /*.dynamic_transfer            =*/ false,
+        /*.async_coord                 =*/ false,
     };
 
     return result;

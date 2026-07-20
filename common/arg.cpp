@@ -2273,6 +2273,43 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.auto_placement = true;
         }
     ).set_env("LLAMA_ARG_AUTO_PLACEMENT"));
+
+    add_opt(common_arg(
+        {"--dynamic-transfer"},
+        "[EXPERIMENTAL] enable runtime dynamic CPU-GPU tensor promotion",
+        [](common_params & params) {
+            params.dynamic_transfer = true;
+        }
+    ).set_env("LLAMA_ARG_DYNAMIC_TRANSFER"));
+
+    add_opt(common_arg(
+        {"--async-coord"},
+        "[EXPERIMENTAL] enable async CPU-GPU coordination with CUDA streams",
+        [](common_params & params) {
+            params.async_coord = true;
+        }
+    ).set_env("LLAMA_ARG_ASYNC_COORD"));
+
+    add_opt(common_arg(
+        {"--atsinfer"},
+        "[EXPERIMENTAL] enable all ATSInfer features (profiling + placement + transfer + async)",
+        [](common_params & params) {
+            params.atsinfer = true;
+            params.profile_tensors = true;
+            params.auto_placement = true;
+            params.dynamic_transfer = true;
+            params.async_coord = true;
+        }
+    ).set_env("LLAMA_ARG_ATSINFER"));
+
+    add_opt(common_arg(
+        {"--mtp-prefetch"},
+        "[EXPERIMENTAL] MTP-guided expert prefetching (uses draft routing to predict hot experts)",
+        [](common_params & params) {
+            params.mtp_prefetch = true;
+        }
+    ).set_env("LLAMA_ARG_MTP_PREFETCH"));
+
     add_opt(common_arg(
         {"-ctk", "--cache-type-k"}, "TYPE",
         string_format(

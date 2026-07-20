@@ -598,6 +598,10 @@ struct common_params {
     bool no_host           = false; // bypass host buffer allowing extra buffers to be used
     bool profile_tensors   = false; // profile per-tensor CPU/GPU performance
     bool auto_placement    = false; // automatically apply optimal tensor placement
+    bool dynamic_transfer  = false; // runtime dynamic CPU↔GPU tensor promotion
+    bool async_coord       = false; // async CPU-GPU coordination with CUDA streams
+    bool atsinfer          = false; // enable all ATSInfer features
+    bool mtp_prefetch      = false; // MTP-guided expert prefetching
 
     bool single_turn       = false; // single turn chat conversation
 

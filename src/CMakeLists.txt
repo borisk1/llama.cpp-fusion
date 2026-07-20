@@ -40,6 +40,8 @@ add_library(llama
             llama-sampler.cpp
             llama-tensor-profiler.cpp
             llama-dynamic-transfer.cpp
+            llama-async-coord.cpp
+            llama-router-trace.cpp
             llama-vocab.cpp
             unicode-data.cpp
             unicode.cpp
