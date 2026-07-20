@@ -301,6 +301,41 @@ GGML_CUDA_MOE_CACHE_BUDGET_MB=11000 \
 
 ---
 
+## 🧪 ATSInfer — Experimental Tensor Scheduling
+
+[EXPERIMENTAL] Tensor-granularity scheduling for optimal CPU/GPU/Multi-GPU placement. All features are opt-in flags.
+
+| Flag | Purpose |
+|------|---------|
+| `--atsinfer` | Enable all ATSInfer features at once |
+| `--profile-tensors` | Profile per-tensor CPU/GPU execution time |
+| `--auto-placement` | Auto-generate optimal `--override-tensor` commands |
+| `--dynamic-transfer` | Runtime CPU-GPU load monitoring |
+| `--async-coord` | Async CPU-GPU coordination (CUDA stream) |
+| `--mtp-prefetch` | MTP-guided expert prefetching (hot-cache) |
+
+**How it works:**
+
+1. `--profile-tensors` measures or estimates each tensor's execution time on CPU and GPU
+2. The layer-aware knapsack solver selects which tensors benefit most from GPU placement
+3. `--auto-placement` saves the optimal `--override-tensor` commands to `/tmp/llama_placement.cfg`
+4. On a subsequent run, apply with: `--override-tensor "$(cat /tmp/llama_placement.cfg | paste -sd,)"`
+
+**Known limitations:**
+- Real GPU measurement only for small tensors (<4 MB) with enough free VRAM (>512 MB)
+- Estimation fallback for large tensors and tight VRAM scenarios
+- `--cpu-moe` conflicts with `--auto-placement` (use one at a time)
+
+```bash
+# Profile and generate placement
+./build/bin/llama-server --atsinfer -m model.gguf --no-mmap -c 4096 -t 24 -b 2048
+# Then restart without --atsinfer using generated overrides
+./build/bin/llama-server -m model.gguf --no-mmap -c 4096 -t 24 -b 2048 \
+  --override-tensor "$(cat /tmp/llama_placement.cfg | paste -sd,)"
+```
+
+---
+
 ## Build
 
 ```bash
