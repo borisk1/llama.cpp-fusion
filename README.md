@@ -326,6 +326,8 @@ GGML_CUDA_MOE_CACHE_BUDGET_MB=11000 \
 - Estimation fallback for large tensors and tight VRAM scenarios
 - `--cpu-moe` conflicts with `--auto-placement` (use one at a time)
 
+Based on the ATSInfer paper: *"ATSInfer: Tensor-Granularity Scheduling for Heterogeneous AI Inference"* — [arxiv 2510.05497](https://arxiv.org/abs/2510.05497)
+
 ```bash
 # Profile and generate placement
 ./build/bin/llama-server --atsinfer -m model.gguf --no-mmap -c 4096 -t 24 -b 2048
