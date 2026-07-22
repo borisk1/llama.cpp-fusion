@@ -25,6 +25,7 @@
 #include "ggml-cpp.h"
 #include "ggml-backend.h"
 
+#include <cstdlib>
 #include <algorithm>
 #include <cassert>
 #include <cfloat>
@@ -1614,9 +1615,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     // tensor profiling (--profile-tensors)
     bool profile_tensors = params.profile_tensors;
+    llama_tensor_profiler profiler;
     if (profile_tensors) {
         fprintf(stderr, "PROFILE: profiling %d layers...\n", n_layer_all);
-        llama_tensor_profiler profiler;
         bool auto_placement = params.auto_placement;
 
         // For each layer, profile key tensors
@@ -1625,28 +1626,27 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             auto * dev = pimpl->dev_layer[il].dev;
             if (!dev) continue;
 
-            // Helper lambda: measure tensor time using estimation
+            // Helper lambda: measure tensor time using GPU backend or estimation
             auto measure = [&](ggml_tensor * t, const char * name, const std::string & op) {
                 if (!t) return;
                 double t_cpu = 0, t_gpu = 0;
 
-                // Estimate CPU time from tensor size
+                // Try real GPU measurement on ACCEL devices only (data must be loaded)
                 size_t nb = ggml_nbytes(t);
-                if (nb > 0) {
-                    // CPU bandwidth ~40 GB/s DDR4
-                    double bw = 40.0 * 1e9 / 1000.0; // bytes per ms
-                    if (op == "RMS_NORM") {
-                        double bytes = (double)ggml_nelements(t) * sizeof(float);
-                        t_cpu = bytes / bw;
-                    } else {
-                        t_cpu = (2.0 * nb) / bw;
+                if (nb > 0 && dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_ACCEL && t->data) {
+                    auto * be = ggml_backend_dev_init(dev, nullptr);
+                    if (be) {
+                        t_gpu = profiler.measure_tensor_on_backend(
+                            format("blk.%d.%s", il, name), t, be, op);
+                        ggml_backend_free(be);
                     }
-                    t_cpu += 0.2; // CPU scheduling overhead
-                    t_cpu = std::max(t_cpu, 0.001);
                 }
-
-                // Estimate GPU time: CPU / speedup ratio
-                if (t_cpu > 0) {
+                // Pure estimation fallback (CPU or failed GPU meas)
+                if (t_gpu <= 0) {
+                    double bw = 40.0 * 1e9 / 1000.0;
+                    t_cpu = (2.0 * nb) / bw;
+                    t_cpu += 0.2;
+                    t_cpu = std::max(t_cpu, 0.001);
                     t_gpu = t_cpu / (op == "RMS_NORM" ? 5.0 : 20.0);
                 }
 
@@ -1690,6 +1690,15 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             vram_free += free;
         }
         double budget = 0.85 * vram_free;
+        // Allow overriding budget via env var (for simulation)
+        const char * budget_env = getenv("LLAMA_ARG_ATSINFER_BUDGET");
+        if (budget_env) {
+            double mb = atof(budget_env);
+            if (mb > 0) {
+                budget = mb * 1024.0 * 1024.0;
+                fprintf(stderr, "PROFILE: knapsack budget OVERRIDE=%.0f MB (env)\n", mb);
+            }
+        }
         fprintf(stderr, "PROFILE: knapsack budget=%.0f MB (VRAM free=%.0f MB)\n",
                 budget / (1024.0*1024.0), vram_free / (1024.0*1024.0));
         auto solution = profiler.solve_knapsack(budget, 12.0);
@@ -1745,7 +1754,45 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
-    // hot-expert VRAM residency (env LLAMA_HOT_RESIDENT): keep top-N experts
+    // Post-load GPU measurement (tensor data now available)
+    if (profile_tensors) {
+        auto * dev_accel = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_ACCEL);
+        if (dev_accel) {
+            auto * be = ggml_backend_dev_init(dev_accel, nullptr);
+            if (be) {
+                int n_measured = 0;
+                for (size_t il = 0; il < layers.size() && n_measured < 20; il++) {
+                    auto & layer = layers[il];
+                    auto * dev = pimpl->dev_layer[il].dev;
+                    if (!dev || ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_ACCEL) continue;
+                    struct { ggml_tensor * t; const char * name; std::string op; } candidates[] = {
+                        {layer.attn_norm,   "attn_norm",   "RMS_NORM"},
+                        {layer.wq,           "wq",           "MUL_MAT"},
+                        {layer.wk,           "wk",           "MUL_MAT"},
+                        {layer.wv,           "wv",           "MUL_MAT"},
+                        {layer.wo,           "wo",           "MUL_MAT"},
+                    };
+                    for (auto & c : candidates) {
+                        if (!c.t || !c.t->buffer || !c.t->data) continue;
+                        double t = profiler.measure_tensor_on_backend(
+                            format("blk.%d.%s", (int)il, c.name), c.t, be, c.op);
+                        if (t > 0) {
+                            profiler.record_measurement(
+                                format("blk.%d.%s", (int)il, c.name), c.op,
+                                ggml_nbytes(c.t), 0, t);
+                            n_measured++;
+                        }
+                    }
+                }
+                ggml_backend_free(be);
+                if (n_measured > 0) {
+                    fprintf(stderr, "PROFILE: real GPU measurement for %d tensors\n", n_measured);
+                }
+            }
+        }
+    }
+
+    // hot-expert VRAM residency
     // of each MoE layer resident on the GPU while fused tensors stay on CPU
     if (llama_hot_resident_enabled()) {
         for (size_t il = 0; il < layers.size(); il++) {
@@ -2447,6 +2494,7 @@ llama_model_params llama_model_default_params() {
         /*.auto_placement              =*/ false,
         /*.dynamic_transfer            =*/ false,
         /*.async_coord                 =*/ false,
+        /*.epd                         =*/ false,
     };
 
     return result;

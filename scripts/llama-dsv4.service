@@ -1,0 +1,20 @@
+[Unit]
+Description=DSV4 Flash Inference Server (v2-gpu-layers)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+User=root
+WorkingDirectory=/mnt/raid0/mtp-prefetch/llama.cpp
+ExecStart=/mnt/raid0/mtp-prefetch/llama.cpp/scripts/prod-server.sh prod
+Restart=always
+RestartSec=10
+LimitNOFILE=65536
+OOMScoreAdjust=-100
+Environment=GGML_CUDA_MOE_CACHE=1
+Environment=GGML_CUDA_MOE_CACHE_BUDGET_MB=11000
+Environment=GGML_CUDA_MOE_CACHE_STATS=200
+
+[Install]
+WantedBy=multi-user.target

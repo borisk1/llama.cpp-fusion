@@ -597,9 +597,11 @@ struct common_params {
     bool no_extra_bufts    = false; // disable extra buffer types (used for weight repacking)
     bool no_host           = false; // bypass host buffer allowing extra buffers to be used
     bool profile_tensors   = false; // profile per-tensor CPU/GPU performance
+    int  atsinfer_budget_mb = 0;     // simulated VRAM budget for ATSInfer (0 = real free VRAM)
     bool auto_placement    = false; // automatically apply optimal tensor placement
     bool dynamic_transfer  = false; // runtime dynamic CPU↔GPU tensor promotion
     bool async_coord       = false; // async CPU-GPU coordination with CUDA streams
+    bool epd               = false; // runtime EPD measurement
     bool atsinfer          = false; // enable all ATSInfer features
     bool mtp_prefetch      = false; // MTP-guided expert prefetching
 

@@ -1,6 +1,15 @@
 // llama-tensor-profiler.cpp — Tensor profiling implementation
 #include "llama-tensor-profiler.h"
 #include "llama-impl.h"
+
+// CUDA event timing functions (from llama-cuda-stream.cu)
+extern "C" {
+    void * llama_cuda_event_create();
+    void   llama_cuda_event_destroy(void *);
+    int    llama_cuda_event_record(void *, void *);
+    int    llama_cuda_event_sync(void *);
+    float  llama_cuda_event_elapsed_ms(void *, void *);
+}
 #include <algorithm>
 #include <numeric>
 #include <cstring>
@@ -53,6 +62,37 @@ void llama_tensor_profiler::calculate_epd() {
         double avg_gpu = entry.t_gpu / std::max(entry.count, 1);
 
         entry.benefit = avg_cpu - avg_gpu;
+
+        // Quant-type aware benefit adjustment
+        // Higher-bit quant types have more compute per byte,
+        // so GPU offload delivers larger absolute benefit.
+        // Infer quant density from tensor name patterns.
+        // Ex: ffn_gate_exps = MoE experts (IQ2_XXS or Q4_K)
+        //     attn weights = Q8_0 or F16 in typical DSV4 configs
+        if (entry.size > 0) {
+            double bpw = 0; // bits per weight (0 = unknown)
+            // Detect from known DSV4 tensor quant patterns
+            if (name.find("ffn_gate_exps") != std::string::npos ||
+                name.find("ffn_up_exps")   != std::string::npos ||
+                name.find("ffn_down_exps") != std::string::npos) {
+                bpw = 4.5; // Q4_K expert layers 37-42, IQ2_XXS rest
+            } else if (name.find("attn_q_a") != std::string::npos ||
+                       name.find("attn_q_b") != std::string::npos ||
+                       name.find("attn_kv_a") != std::string::npos ||
+                       name.find("attn_kv_b") != std::string::npos ||
+                       name.find("attn_output") != std::string::npos ||
+                       name.find("wo_a") != std::string::npos ||
+                       name.find("wo_b") != std::string::npos) {
+                bpw = 8.0; // Q8_0 attention weights
+            } else if (name.find("norm") != std::string::npos) {
+                bpw = 16.0; // F16 norms
+            }
+            if (bpw > 0) {
+                // Normalize to IQ2_XXS (2.5 bpw) = 1.0x factor
+                double quant_factor = bpw / 2.5;
+                entry.benefit *= quant_factor;
+            }
+        }
 
         // EPD: time per byte (lower is better for CPU, higher benefit for GPU)
         if (entry.size > 0) {
@@ -153,23 +193,53 @@ double llama_tensor_profiler::measure_tensor_on_backend(
     size_t nbytes = ggml_nbytes(tensor);
     if (nbytes == 0) return 0.0;
 
-    // Check if real GPU measurement is feasible.
-    // Real measurement creates a weight copy on the GPU, which requires
-    // free VRAM. On multi-GPU setups with models loaded, VRAM is tight.
     auto * dev = ggml_backend_get_device(backend);
-    bool use_real = false;
+
+    // --- Real GPU measurement via CUDA events ---
+    // Only for small tensors with sufficient free VRAM.
+    // Skip if dev is null (backend without device).
+
+    size_t needed = nbytes * 3 + 128ULL * 1024 * 1024;
+    size_t free_mem = 0, total_mem = 0;
+    bool can_measure = false;
+
     if (dev && nbytes <= 4ULL * 1024ULL * 1024ULL) {
-        size_t total = 0, free = 0;
-        ggml_backend_dev_memory(dev, &free, &total);
-        use_real = (free > 512ULL * 1024ULL * 1024ULL);
+        // Only attempt real GPU measurement on ACCEL devices
+        if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_ACCEL) {
+            ggml_backend_dev_memory(dev, &free_mem, &total_mem);
+            can_measure = (free_mem > needed + 256ULL * 1024 * 1024);
+        }
     }
 
-    if (!use_real) {
-        // Estimation fallback
+    if (!can_measure) {
+        // Estimation fallback with quant-type awareness
+        // Different quant types have different compute density:
+        // Higher bpw = more compute per byte = more GPU benefit
+        double compute_factor = 1.0;
+        if (tensor) {
+            auto tt = tensor->type;
+            // Normalize to IQ2_XXS (2.5 bpw) = 1.0
+            if (tt == GGML_TYPE_F32)       compute_factor = 12.8;
+            else if (tt == GGML_TYPE_F16)   compute_factor = 6.4;
+            else if (tt == GGML_TYPE_Q8_0)  compute_factor = 3.2;
+            else if (tt == GGML_TYPE_Q4_K)  compute_factor = 1.8;
+            else if (tt == GGML_TYPE_Q2_K)  compute_factor = 1.0;
+            else if (tt == GGML_TYPE_IQ4_NL)compute_factor = 1.5;
+            else if (tt == GGML_TYPE_IQ3_S) compute_factor = 1.2;
+            else if (tt == GGML_TYPE_IQ2_S) compute_factor = 1.0;
+            else if (tt == GGML_TYPE_IQ2_XS) compute_factor = 1.0;
+            else if (tt == GGML_TYPE_IQ2_XXS) compute_factor = 1.0;
+            // IQ1_S is experimental, use 0.5
+            else if (tt == GGML_TYPE_IQ1_S) compute_factor = 0.5;
+        }
         if (dev) {
-            size_t total = 0, free = 0;
-            ggml_backend_dev_memory(dev, &free, &total);
-            double bw = std::min((total / 1e9) * 15.0, 2000.0);
+            if (nbytes <= 4ULL * 1024ULL * 1024ULL) {
+                fprintf(stderr, "measure: %s %s = skipped real (VRAM: %zu MB free, need %zu MB)\n",
+                        op_type.c_str(), tensor_name.c_str(),
+                        free_mem >> 20, needed >> 20);
+            }
+            double bw = std::min((total_mem / 1e9) * 15.0, 2000.0);
+            if (bw < 1) bw = 40.0; // fallback DDR4
             double t = (2.0 * nbytes) / (bw * 1e9 / 1000.0);
             fprintf(stderr, "measure: %s %s = %.4f ms (est, %.0f MB, %.0f GB/s)\n",
                     op_type.c_str(), tensor_name.c_str(), t,
@@ -179,13 +249,12 @@ double llama_tensor_profiler::measure_tensor_on_backend(
         return 0.0;
     }
 
-    // Real GPU measurement via weight copy
-    // Creates a local copy of the weight tensor in our ggml context,
-    // avoiding cross-context issues with ggml_backend_alloc_ctx_tensors
-    if (!dev) return 0.0;
+    // Compute ggml context size proportional to tensor size
+    size_t ctx_size = std::max((size_t)1024 * 1024, nbytes * 4);
+    ctx_size = std::min(ctx_size, (size_t)512 * 1024 * 1024); // cap at 512 MB
 
     struct ggml_init_params params = {
-        /*.mem_size   =*/ 1024 * 1024 * 128, // 128 MB
+        /*.mem_size   =*/ ctx_size,
         /*.mem_buffer =*/ NULL,
         /*.no_alloc   =*/ true,
     };
@@ -249,9 +318,38 @@ double llama_tensor_profiler::measure_tensor_on_backend(
         for (int64_t i = 0; i < ggml_nelements(inp) && i < 256; i++) d[i] = 1.0f;
     }
 
-    // Warmup + timed runs
+    // Warmup + timed runs with CUDA events for precise GPU timing
     ggml_backend_graph_compute(backend, gf);
 
+    // Try CUDA event timing
+    void * ev_start = llama_cuda_event_create();
+    void * ev_stop  = llama_cuda_event_create();
+
+    if (ev_start && ev_stop) {
+        llama_cuda_event_record(ev_start, nullptr);
+        ggml_backend_graph_compute(backend, gf);
+        llama_cuda_event_record(ev_stop, nullptr);
+        llama_cuda_event_sync(ev_stop);
+
+        float gpu_ms = llama_cuda_event_elapsed_ms(ev_start, ev_stop);
+        llama_cuda_event_destroy(ev_start);
+        llama_cuda_event_destroy(ev_stop);
+
+        if (gpu_ms > 0) {
+            double avg_ms = gpu_ms;
+            fprintf(stderr, "measure: %s %s = %.4f ms (CUDA event, %.0f MB)\n",
+                    op_type.c_str(), tensor_name.c_str(), avg_ms,
+                    nbytes / (1024.0 * 1024.0));
+            ggml_backend_buffer_free(buf);
+            ggml_free(ctx);
+            return avg_ms;
+        }
+    } else {
+        if (ev_start) llama_cuda_event_destroy(ev_start);
+        if (ev_stop)  llama_cuda_event_destroy(ev_stop);
+    }
+
+    // Fallback: multi-iteration chrono timing
     int n_iter = std::max(1, std::min(30, (int)(10000 / std::max(nbytes, (size_t)1))));
     auto t0 = std::chrono::high_resolution_clock::now();
     for (int i = 0; i < n_iter; i++) {
@@ -266,7 +364,6 @@ double llama_tensor_profiler::measure_tensor_on_backend(
     fprintf(stderr, "measure: %s %s = %.4f ms (%d runs, %.0f MB)\n",
             op_type.c_str(), tensor_name.c_str(), avg_ms, n_iter,
             nbytes / (1024.0 * 1024.0));
-
     return avg_ms;
 }
 
@@ -301,12 +398,11 @@ void llama_tensor_profiler::clear() {
 }
 
 llama_tensor_profiler::placement_solution llama_tensor_profiler::solve_knapsack(double vram_budget_bytes, double pcie_bw_gbs) const {
-    // Build list of items for knapsack
     struct item {
         std::string name;
-        double      benefit;
-        size_t      size;
-        double      benefit_per_byte;
+        double      benefit;    // r_i = t_cpu - t_gpu
+        size_t      size;       // s_i
+        bool        is_expert;  // expert tensor?
         int         layer;
         std::string op_type;
     };
@@ -316,126 +412,143 @@ llama_tensor_profiler::placement_solution llama_tensor_profiler::solve_knapsack(
         return {};
     }
 
-    // Group entries by layer
-    std::unordered_map<int, std::vector<const tensor_profile_entry*>> by_layer;
-    int max_layer = 0;
+    // Build ordered list of tensors (graph order: layer → operation)
+    std::vector<item> items;
     for (const auto & [name, entry] : entries) {
         if (entry.count == 0 || entry.size == 0) continue;
-        int l = entry.layer;
-        if (l < 0) continue; // skip unlayered tensors
-        by_layer[l].push_back(&entry);
-        max_layer = std::max(max_layer, l);
+        if (entry.layer < 0) continue;
+        items.push_back({
+            name, entry.benefit, entry.size,
+            (name.find("exps") != std::string::npos),
+            entry.layer, entry.op_type
+        });
+    }
+    if (items.empty()) { return {}; }
+
+    double mb = 1024.0 * 1024.0;
+
+    // Sort by (layer, operation_order) — must match graph topology
+    auto op_order = [](const std::string & n) {
+        if (n.find("ffn_gate_exps") != std::string::npos) return 10;
+        if (n.find("ffn_gate_inp")  != std::string::npos) return 11;
+        if (n.find("ffn_up_exps")   != std::string::npos) return 12;
+        if (n.find("ffn_down_exps") != std::string::npos) return 13;
+        if (n.find("ffn_gate_shexp")!= std::string::npos) return 20;
+        if (n.find("ffn_up_shexp")  != std::string::npos) return 21;
+        if (n.find("ffn_down_shexp")!= std::string::npos) return 22;
+        if (n.find("attn_q")        != std::string::npos) return 30;
+        if (n.find("attn_kv")       != std::string::npos) return 31;
+        if (n.find("attn_output")   != std::string::npos) return 32;
+        if (n.find("wo_a")          != std::string::npos) return 33;
+        if (n.find("wo_b")          != std::string::npos) return 34;
+        if (n.find("_norm")         != std::string::npos) return 40;
+        if (n.find("hc_")           != std::string::npos) return 45;
+        return 99;
+    };
+    std::sort(items.begin(), items.end(),
+        [&](const item & a, const item & b) {
+            if (a.layer != b.layer) return a.layer < b.layer;
+            int oa = op_order(a.name), ob = op_order(b.name);
+            return oa != ob ? oa < ob : a.name < b.name;
+        });
+
+    // MoE partitioning (Algorithm 1 lines 10-21)
+    std::vector<item> exp_items, non_exp_items;
+    double exp_sz = 0, non_exp_sz = 0;
+    for (auto & it : items) {
+        if (it.is_expert) { exp_items.push_back(it); exp_sz += it.size; }
+        else { non_exp_items.push_back(it); non_exp_sz += it.size; }
     }
 
-    // For each layer, compute total benefit, size, and priority
-    // Priority = benefit / size * layer_depth_factor
-    // where layer_depth_factor = 1 + (max_layer - l) / max_layer  (0..2× boost)
-    // This gives earlier layers up to 2× priority vs last layer
-    struct layer_item {
-        int    layer_id;
-        double total_benefit;
-        size_t total_size;
-        double priority;
-        std::vector<const tensor_profile_entry*> tensors;
+    // DP with switching cost: max Σ(r_i*x_i) - Σ(c_i*switch_i) s.t. Σ(s_i*x_i) ≤ M
+    auto solve_dp = [&](const std::vector<item> & tensor_list, double budget) -> std::vector<bool> {
+        int m = (int)tensor_list.size();
+        if (m == 0 || budget <= 0) return std::vector<bool>(m, false);
+        double bw = (pcie_bw_gbs > 0) ? pcie_bw_gbs * 1e9 / 1e3 : 30.0; // bytes/ms
+        int M = std::max(1, (int)(budget / mb));
+        std::vector<double> dp(M + 1, -1e18);
+        std::vector<std::vector<char>> choice(m, std::vector<char>(M + 1, 0));
+        dp[0] = 0;
+
+        for (int i = 0; i < m; i++) {
+            int s = std::max(1, (int)(tensor_list[i].size / mb));
+            double r = tensor_list[i].benefit;
+            double c = 0.005; // default switching cost ~0.005ms (small activation)
+            if (tensor_list[i].op_type == "MUL_MAT_ID")
+                c = (128.0 * 4096.0 * 4.0) / bw; // expert output activation
+            else if (tensor_list[i].op_type == "MUL_MAT")
+                c = (4096.0 * 4.0) / bw; // attention activation
+
+            std::vector<double> ndp(M + 1, -1e18);
+            for (int w = 0; w <= M; w++) {
+                if (dp[w] < -1e17) continue;
+                // CPU placement (no VRAM cost)
+                double cpu_v = dp[w] - (i > 0 && choice[i-1][w] == 1 ? c : 0);
+                if (cpu_v > ndp[w]) { ndp[w] = cpu_v; choice[i][w] = 0; }
+                // GPU placement (costs s MB, gains r benefit)
+                if (w + s <= M) {
+                    double gpu_v = dp[w] + r - (i > 0 && choice[i-1][w] == 0 ? c : 0);
+                    if (gpu_v > ndp[w + s]) { ndp[w + s] = gpu_v; choice[i][w + s] = 1; }
+                }
+            }
+            dp = std::move(ndp);
+        }
+
+        int best_w = (int)(std::max_element(dp.begin(), dp.end()) - dp.begin());
+        std::vector<bool> placement(m, false);
+        for (int i = m - 1, w = best_w; i >= 0; i--) {
+            placement[i] = (choice[i][w] == 1);
+            if (placement[i]) w -= std::max(1, (int)(tensor_list[i].size / mb));
+        }
+        return placement;
     };
 
-    std::vector<layer_item> layers;
-    for (auto & [l, tensors] : by_layer) {
-        double benefit = 0;
-        size_t size = 0;
-        for (auto * t : tensors) {
-            benefit += t->benefit;
-            size    += t->size;
-        }
-        // Layer depth factor: earlier layers get higher priority
-        double depth_factor = 1.0;
-        int layer_count = max_layer + 1;
-        if (layer_count > 0) {
-            // Linear boost: layer 0 gets ~2×, last layer gets 1×
-            depth_factor = 1.0 + (double)(layer_count - 1 - l) / layer_count;
-        }
-        double priority = (size > 0) ? (benefit / size) * depth_factor : 0;
-        layers.push_back({l, benefit, size, priority, tensors});
-    }
-
-    // Sort layers by priority descending
-    std::sort(layers.begin(), layers.end(), [](const layer_item & a, const layer_item & b) {
-        return a.priority > b.priority;
-    });
-
-    // Re-order: create a per-tensor list sorted by layer priority first,
-    // then within each layer by individual benefit_per_byte.
-    // This way, all tensors from high-priority layers come first.
-    std::vector<const tensor_profile_entry*> sorted_all;
-    for (const auto & layer : layers) {
-        std::vector<const tensor_profile_entry*> layer_tensors = layer.tensors;
-        std::sort(layer_tensors.begin(), layer_tensors.end(),
-            [](const tensor_profile_entry * a, const tensor_profile_entry * b) {
-                return (a->benefit / a->size) > (b->benefit / b->size);
-            });
-        for (auto * t : layer_tensors) {
-            sorted_all.push_back(t);
-        }
-    }
-
-    // Greedy selection within budget (from sorted_all)
     placement_solution result;
-    result.total_benefit = 0;
-    result.total_size = 0;
-    size_t used = 0;
+    auto add_gpu = [&](const item & it) {
+        result.gpu_tensors.push_back(it.name);
+        result.total_benefit += it.benefit;
+        result.total_size += it.size;
+    };
+    auto add_cpu = [&](const item & it) {
+        result.cpu_tensors.push_back(it.name);
+    };
 
-    // First pass: try to place COMPLETE layers (for minimum switching)
-    for (const auto & layer : layers) {
-        if (used + layer.total_size > vram_budget_bytes) continue;
-        for (auto * t : layer.tensors) {
-            result.gpu_tensors.push_back(t->name);
+    if (!exp_items.empty() && !non_exp_items.empty()) {
+        // MoE: Algorithm 1 partitioning
+        if (non_exp_sz <= vram_budget_bytes) {
+            double exp_budget = vram_budget_bytes - non_exp_sz;
+            double total_exp = 0;
+            for (auto & e : exp_items) total_exp += e.size;
+            if (total_exp <= exp_budget) {
+                for (auto & it : items) add_gpu(it);
+                fprintf(stderr, "knapsack DP: all fit (%.0f MB)\n", result.total_size/mb);
+                return result;
+            }
+            for (auto & it : non_exp_items) add_gpu(it);
+            auto p = solve_dp(exp_items, exp_budget);
+            for (int i = 0; i < (int)exp_items.size(); i++)
+                p[i] ? add_gpu(exp_items[i]) : add_cpu(exp_items[i]);
+        } else {
+            auto p = solve_dp(non_exp_items, vram_budget_bytes);
+            for (int i = 0; i < (int)non_exp_items.size(); i++)
+                p[i] ? add_gpu(non_exp_items[i]) : add_cpu(non_exp_items[i]);
+            for (auto & it : exp_items) add_cpu(it);
         }
-        result.total_benefit += layer.total_benefit;
-        result.total_size += layer.total_size;
-        used += layer.total_size;
+    } else {
+        auto p = solve_dp(items, vram_budget_bytes);
+        for (int i = 0; i < (int)items.size(); i++)
+            p[i] ? add_gpu(items[i]) : add_cpu(items[i]);
     }
 
-    // Second pass: fill remaining VRAM with individual high-benefit tensors
-    // from layers that didn't fit completely
-    for (const auto * t : sorted_all) {
-        // Skip if already placed
-        if (std::find(result.gpu_tensors.begin(), result.gpu_tensors.end(), t->name) != result.gpu_tensors.end()) {
-            continue;
-        }
-        if (used + t->size > vram_budget_bytes) continue;
-        result.gpu_tensors.push_back(t->name);
-        result.total_benefit += t->benefit;
-        result.total_size += t->size;
-        used += t->size;
-    }
-
-    // Build CPU list (everything not in GPU list)
-    for (const auto & [name, entry] : entries) {
-        if (entry.count == 0 || entry.size == 0) continue;
-        if (std::find(result.gpu_tensors.begin(), result.gpu_tensors.end(), name) == result.gpu_tensors.end()) {
-            result.cpu_tensors.push_back(name);
-        }
-    }
-
-    // Apply switching cost penalty
     int switches = 0;
     for (size_t i = 1; i < result.gpu_tensors.size(); i++) {
-        int l1 = -1, l2 = -1;
         auto it1 = entries.find(result.gpu_tensors[i-1]);
         auto it2 = entries.find(result.gpu_tensors[i]);
-        if (it1 != entries.end() && it2 != entries.end()) {
-            l1 = it1->second.layer;
-            l2 = it2->second.layer;
-        }
-        if (l1 != l2) switches++;
+        if (it1 != entries.end() && it2 != entries.end() &&
+            it1->second.layer != it2->second.layer) switches++;
     }
-
-    double switching_penalty = switches * 0.001; // ~1ms per switch
-    result.total_benefit -= switching_penalty;
-
-    fprintf(stderr, "knapsack: selected %zu GPU tensors (%.0f MB, benefit %.2f ms, %d switches)\n",
-                   result.gpu_tensors.size(), result.total_size / (1024.0*1024.0),
-                   result.total_benefit, switches);
-
+    fprintf(stderr, "knapsack DP: selected %zu GPU (%.0f MB, benefit %.2f ms, %d switches)\n",
+            result.gpu_tensors.size(), result.total_size / mb,
+            result.total_benefit, switches);
     return result;
 }

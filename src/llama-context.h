@@ -11,8 +11,11 @@
 #include "ggml-cpp.h"
 #include "ggml-opt.h"
 
+#include "llama-tensor-profiler.h"
+
 #include <map>
 #include <vector>
+#include <memory>
 #include <chrono>
 
 struct llama_model;
@@ -40,6 +43,12 @@ struct llama_memory_buffer {
 
 using llama_memory_buffers = std::map<ggml_backend_buffer_type_t, llama_memory_buffer>;
 
+class llama_async_coord;
+class llama_dynamic_transfer;
+
+// Forward declare to avoid circular includes
+// Full definition in llama-dynamic-transfer.h
+
 struct llama_context {
     // init scheduler and compute buffers, reserve worst-case graphs
     llama_context(
@@ -56,8 +65,14 @@ struct llama_context {
     //   - etc.
     void sched_reserve();
 
-    void set_dynamic_transfer(bool enabled) { dynamic_transfer_enabled = enabled; }
+    void init_dynamic_transfer();
+
+    void set_dynamic_transfer(bool enabled) {
+        dynamic_transfer_enabled = enabled;
+    }
     void set_async_coord(bool enabled)      { async_coord_enabled = enabled; }
+    void set_epd(bool enabled)               { epd_enabled = enabled; }
+    void set_mtp_prefetch(bool enabled)      { mtp_prefetch_enabled = enabled; }
 
     void synchronize();
 
@@ -383,12 +398,28 @@ private:
 
     // Dynamic transfer runtime monitor
     bool dynamic_transfer_enabled = false;
-    std::chrono::high_resolution_clock::time_point dt_last_step;
+    std::chrono::high_resolution_clock::time_point dt_last_step = std::chrono::high_resolution_clock::now();
     int  dt_step_count = 0;
 
     // Async coordination
     bool async_coord_enabled = false;
     int  ac_step_count = 0;
+
+    // Runtime EPD (Execution Plane Descriptor) measurement
+    bool epd_enabled = false;
+    int  epd_step_count = 0;
+    int  epd_reknapsack_count = 0;
+    void epd_record_sample(const char * tensor_name, enum ggml_op op, float gpu_ms);
+    void epd_try_reknapsack(struct ggml_cgraph * current_gf);
+    llama_tensor_profiler runtime_profiler;
+
+    // MTP-guided expert prefetching (opt-in via --mtp-prefetch)
+    bool mtp_prefetch_enabled = false;
+    std::unique_ptr<llama_async_coord> _async_coord;
+
+    // Dynamic transfer scheduler (Algorithm 2)
+    std::unique_ptr<llama_dynamic_transfer> _dynamic_transfer;
+    int dt_sched_step_count = 0;
 
     // perf
     mutable int64_t t_start_us  = 0;

@@ -1,105 +1,75 @@
-// llama-dynamic-transfer.h — Load-aware dynamic tensor transfer (ATSInfer §4.4)
-// Monitors runtime hardware load and dynamically promotes CPU-resident tensors to GPU.
+// llama-dynamic-transfer.h — Dynamic Transfer Scheduling (ATSInfer §4.4, Algorithm 2)
+// Decides which CPU-resident tensors to temporarily promote to GPU each step,
+// overlapping weight transfers with computation.
 #ifndef LLAMA_DYNAMIC_TRANSFER_H
 #define LLAMA_DYNAMIC_TRANSFER_H
 
-#include "llama-tensor-profiler.h"
 #include "ggml.h"
 #include "ggml-backend.h"
 #include <string>
 #include <vector>
-#include <deque>
-#include <chrono>
-#include <atomic>
+#include <memory>
+#include <functional>
 
-// Performance sample for load monitoring
-struct perf_sample {
-    double cpu_latency_ms;     // measured CPU op latency
-    double gpu_latency_ms;     // measured GPU op latency  
-    double pcie_transfer_ms;   // measured PCIe transfer time
-    size_t bytes_transferred;  // bytes transferred in this sample
-    double wall_time;          // wall clock timestamp
+// Info about one tensor for the dynamic transfer solver
+struct dt_tensor_info {
+    std::string name;
+    size_t      size;           // tensor size in bytes
+    bool        is_gpu_default; // true if static placement put it on GPU
+    double      t_cpu;          // measured CPU execution time (ms)
+    double      t_gpu;          // measured GPU execution time (ms)
+    size_t      activation_size; // activation size at backend boundary (bytes)
+    int         layer;
+    std::string op_type;
 };
 
-// Dynamic transfer config
-struct dynamic_transfer_config {
-    bool   enabled           = false;
-    double monitor_interval  = 1.0;    // seconds between load checks
-    double promotion_threshold = 0.15; // min benefit/byte ratio for promotion
-    double demotion_threshold  = 0.05; // below this, demote from GPU
-    size_t temp_buffer_size   = 512 * 1024 * 1024; // 512 MB temp GPU buffer for promotions
-    int    history_window     = 10;    // number of samples for moving average
+// Result: which tensors to promote and what to transfer
+struct dt_promotion_plan {
+    // Tensors to promote: CPU → GPU for this step
+    std::vector<std::string> promote_tensor_names;
+    size_t total_transfer_bytes = 0;
+    double estimated_benefit_ms = 0;  // time saved vs no promotion
+    double exposed_transfer_ms  = 0;  // non-overlapped transfer time
+    int    n_promoted           = 0;
+    bool   valid                = false;
+
+    // For each promoted tensor, the estimated overlap window
+    std::vector<double> overlap_windows_ms;
 };
 
+// Dynamic Transfer Scheduler (Algorithm 2 from ATSInfer paper)
+// O(n²) time, O(n) auxiliary space
+// n = number of CPU-resident tensors (after static placement)
 class llama_dynamic_transfer {
 public:
     llama_dynamic_transfer();
     ~llama_dynamic_transfer();
 
-    // Initialize with config and device info
-    void init(const dynamic_transfer_config & cfg, 
-              ggml_backend_t gpu_backend,
-              ggml_backend_t cpu_backend,
-              size_t total_vram_bytes);
+    // Initialize with PCIe bandwidth estimate
+    void init(double pcie_bw_gbs);
 
-    // Record a performance sample (called after each step)
-    void record_sample(const perf_sample & sample);
-
-    // Get current load estimate (normalized 0.0-1.0)
-    double get_cpu_load() const { return _cpu_load; }
-    double get_gpu_load() const { return _gpu_load; }
-    double get_pcie_load() const { return _pcie_load; }
-
-    // Decide which tensors to promote/demote for the next step
-    // Uses the knapsack solution updated with current load conditions
-    llama_tensor_profiler::placement_solution 
-    decide_transfers(const llama_tensor_profiler & profiler,
-                     size_t available_vram_bytes);
-
-    // Execute a promotion (copy tensor from CPU to GPU temp buffer)
-    // Returns true if successful
-    bool promote_tensor(const std::string & tensor_name, 
-                        ggml_tensor * tensor,
-                        ggml_backend_buffer_t temp_buf);
-
-    // Execute a demotion (release GPU temp buffer)
-    void demote_tensor(const std::string & tensor_name);
-
-    // Reset all state
+    // Reset internal state
     void reset();
 
+    // Solve dynamic transfer DP for current step
+    // Input: list of all tensors in execution order, current CPU/GPU/PCIe measurements
+    // Returns: which tensors to promote
+    dt_promotion_plan solve(
+        const std::vector<dt_tensor_info> & tensors,
+        double current_pcie_bw_gbs,
+        double current_cpu_slowdown,  // 1.0 = normal, >1.0 = CPU slower
+        double current_gpu_slowdown   // 1.0 = normal, >1.0 = GPU slower
+    ) const;
+
+    // Print stats
+    void print_stats() const;
+
 private:
-    dynamic_transfer_config _cfg;
-    ggml_backend_t _gpu_backend = nullptr;
-    ggml_backend_t _cpu_backend = nullptr;
-    size_t _total_vram = 0;
+    double _pcie_bw_gbs = 30.0; // default PCIe 3.0 x16
 
-    // Load history for moving average
-    std::deque<perf_sample> _history;
-    
-    // Current load estimates
-    double _cpu_load  = 0.0;
-    double _gpu_load  = 0.0;
-    double _pcie_load = 0.0;
-
-    // Track promoted tensors
-    struct promoted_tensor {
-        std::string name;
-        size_t      size;
-        double      benefit;
-        double      last_used; // timestamp
-    };
-    std::vector<promoted_tensor> _promoted;
-
-    // Timing helpers
-    std::chrono::high_resolution_clock::time_point _last_monitor;
-    std::atomic<bool> _initialized{false};
-
-    // Update load estimates from history
-    void update_load_estimates();
-
-    // Calculate effective benefit under current load
-    double effective_benefit(double base_benefit, size_t size) const;
+    // Stats
+    mutable size_t _solve_count = 0;
+    mutable double _total_solve_us = 0;
 };
 
 #endif // LLAMA_DYNAMIC_TRANSFER_H

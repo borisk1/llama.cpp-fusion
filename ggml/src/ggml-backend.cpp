@@ -14,6 +14,9 @@
 #include "ggml-impl.h"
 #include "ggml-backend-moe-cache.h"
 
+// CUDA stream ops for async tensor transfers (provided by llama-cuda-stream.cu)
+extern "C" int llama_cuda_async_h2d(void * dst, const void * src, size_t size, void * stream);
+
 // MoE expert cache function table; populated by the CUDA backend at registry
 // init when GGML_CUDA_MOE_CACHE=1, consumed by the CPU mul_mat_id kernel.
 struct ggml_moe_cache_api ggml_moe_cache = {};
@@ -833,6 +836,13 @@ struct ggml_backend_sched {
     bool op_offload;
 
     int debug;
+
+    // Persistent tensor backend overrides (survive reset via ggml_backend_sched_set_tensor_backend)
+    struct {
+        struct ggml_tensor * tensor;
+        int                  backend_id;
+    } persistent_ids[64];
+    int n_persistent_ids;
 
     // used for debugging graph reallocations [GGML_SCHED_DEBUG_REALLOC]
     // ref: https://github.com/ggml-org/llama.cpp/pull/17617
@@ -2044,6 +2054,18 @@ void ggml_backend_sched_reset(ggml_backend_sched_t sched) {
     sched->is_alloc = false;
 }
 
+// Re-apply persistent user-set tensor backend IDs after hash_set is rebuilt
+static void ggml_backend_sched_apply_persistent(ggml_backend_sched_t sched) {
+    for (int i = 0; i < sched->n_persistent_ids; i++) {
+        struct ggml_tensor * t = sched->persistent_ids[i].tensor;
+        if (!t) continue;
+        size_t hid = ggml_hash_find(&sched->hash_set, t);
+        if (hid != (size_t)-1) {
+            sched->hv_tensor_backend_ids[hid] = sched->persistent_ids[i].backend_id;
+        }
+    }
+}
+
 void ggml_backend_sched_reserve_size(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph, size_t * sizes) {
     GGML_ASSERT(sched);
     GGML_ASSERT((int)sched->hash_set.size >= measure_graph->n_nodes + measure_graph->n_leafs);
@@ -2055,6 +2077,8 @@ void ggml_backend_sched_reserve_size(ggml_backend_sched_t sched, struct ggml_cgr
 
     ggml_backend_sched_split_graph(sched, measure_graph);
 
+    ggml_backend_sched_apply_persistent(sched);
+
     ggml_gallocr_reserve_n_size(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids, sizes);
 }
 
@@ -2065,6 +2089,8 @@ bool ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph *
     ggml_backend_sched_synchronize(sched);
 
     ggml_backend_sched_split_graph(sched, measure_graph);
+
+    ggml_backend_sched_apply_persistent(sched);
 
     if (!ggml_gallocr_reserve_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids)) {
         return false;
@@ -2181,6 +2207,148 @@ void ggml_backend_sched_set_tensor_backend(ggml_backend_sched_t sched, struct gg
     tensor_backend_id(node) = backend_index;
     SET_CAUSE(node, "usr");
     sched->is_reset = false;
+    // Store in persistent array (survives scheduler reset)
+    bool found = false;
+    for (int i = 0; i < sched->n_persistent_ids; i++) {
+        if (sched->persistent_ids[i].tensor == node) {
+            sched->persistent_ids[i].backend_id = backend_index;
+            found = true;
+            break;
+        }
+    }
+    if (!found && sched->n_persistent_ids < 64) {
+        sched->persistent_ids[sched->n_persistent_ids].tensor    = node;
+        sched->persistent_ids[sched->n_persistent_ids].backend_id = backend_index;
+        sched->n_persistent_ids++;
+    }
+}
+
+// ---- Dynamic tensor promotion (experimental) ----
+// Allocate a tensor on a new backend and copy data.
+int ggml_backend_sched_promote_tensor(ggml_backend_sched_t sched, struct ggml_tensor * tensor, ggml_backend_t target) {
+    GGML_ASSERT(sched);
+    GGML_ASSERT(tensor);
+    GGML_ASSERT(target);
+    if (!tensor->buffer || !tensor->data) return -1;
+
+    ggml_backend_buffer_type_t buft = ggml_backend_sched_get_buffer_type(sched, target);
+    if (!buft) return -2;
+
+    size_t size = ggml_nbytes(tensor);
+    if (size == 0) return -3;
+
+    // Allocate new buffer on target backend
+    ggml_backend_buffer_t new_buf = ggml_backend_buft_alloc_buffer(buft, size);
+    if (!new_buf) return -4;
+
+    void * new_addr = ggml_backend_buffer_get_base(new_buf);
+    if (!new_addr) { ggml_backend_buffer_free(new_buf); return -5; }
+
+    // Re-allocate tensor (copies data, frees old buffer)
+    int ret = ggml_backend_tensor_realloc(tensor, new_buf, new_addr);
+    if (ret != 0) {
+        ggml_backend_buffer_free(new_buf);
+        return ret;
+    }
+
+    // Update scheduler's backend assignment
+    int bid = ggml_backend_sched_backend_id(sched, target);
+    GGML_ASSERT(bid >= 0 && bid < sched->n_backends);
+    tensor_backend_id(tensor) = bid;
+    SET_CAUSE(tensor, "usr");
+    sched->is_reset = false;
+
+    return 0;
+}
+
+// ---- Batch prefetch for graph tensors (experimental) ----
+// For each CPU-resident weight tensor assigned to a GPU backend,
+// allocate a GPU buffer and start async H2D copy on the provided stream.
+// Returns number of transfers submitted.
+int ggml_backend_sched_prefetch_graph_tensors(ggml_backend_sched_t sched, struct ggml_cgraph * graph, void * stream) {
+    GGML_ASSERT(sched);
+    GGML_ASSERT(graph);
+    if (!stream) return 0;
+    int n = 0;
+    int nn = ggml_graph_n_nodes(graph);
+    // Scan INPUT tensors of each graph node (these are the weight tensors)
+    for (int i = 0; i < nn && n < 8; i++) {
+        struct ggml_tensor * op = ggml_graph_node(graph, i);
+        if (!op) continue;
+        for (int j = 0; j < GGML_MAX_SRC && n < 8; j++) {
+            struct ggml_tensor * t = op->src[j];
+            if (!t || !t->buffer || !t->data || t->view_src) continue;
+            int bid = tensor_backend_id(t);
+            if (bid < 0) continue;
+            auto * be = sched->backends[bid];
+            if (!be) continue;
+            auto * dev = ggml_backend_get_device(be);
+            if (!dev || ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_ACCEL) continue;
+            auto * bt = ggml_backend_buffer_get_type(t->buffer);
+            if (!bt) continue;
+            const char * bn = ggml_backend_buft_name(bt);
+            if (!bn || !strstr(bn, "CPU")) continue; // only CPU-resident tensors
+            size_t nb = ggml_nbytes(t);
+            if (nb < 4096 || nb > 64ULL*1024*1024) continue;
+
+            // Allocate GPU buffer for this tensor
+            ggml_backend_buffer_type_t buft = ggml_backend_sched_get_buffer_type(sched, be);
+            if (!buft) continue;
+            ggml_backend_buffer_t gpu_buf = ggml_backend_buft_alloc_buffer(buft, nb);
+            if (!gpu_buf) continue;
+            void * gpu_addr = ggml_backend_buffer_get_base(gpu_buf);
+            if (!gpu_addr) { ggml_backend_buffer_free(gpu_buf); continue; }
+
+            // Save CPU data ptr before swapping
+            void * cpu_data = t->data;
+
+            // Swap tensor to GPU buffer
+            t->buffer = gpu_buf;
+            t->data   = gpu_addr;
+
+            // Async copy from CPU to GPU on provided stream
+            llama_cuda_async_h2d(t->data, cpu_data, nb, stream);
+
+            // Update scheduler backend assignment
+            tensor_backend_id(t) = bid;
+            SET_CAUSE(t, "usr");
+
+            n++;
+        }
+    }
+    return n;
+}
+
+// ---- Backend tensor re-allocation ----
+// Re-allocate a tensor on a new buffer (different backend or buffer type).
+// The old buffer is freed after copying the data.
+// Returns 0 on success, non-zero on error.
+int ggml_backend_tensor_realloc(struct ggml_tensor * tensor, ggml_backend_buffer_t new_buf, void * new_addr) {
+    GGML_ASSERT(tensor);
+    GGML_ASSERT(new_buf);
+    GGML_ASSERT(new_addr);
+    if (!tensor->buffer || !tensor->data) return -1;
+
+    ggml_backend_buffer_t old_buf = tensor->buffer;
+    size_t nbytes = ggml_nbytes(tensor);
+
+    // Save old data pointer
+    void * old_data = tensor->data;
+
+    // Update tensor to new buffer
+    tensor->buffer = new_buf;
+    tensor->data   = new_addr;
+
+    // Initialize in new buffer
+    ggml_backend_buffer_init_tensor(new_buf, tensor);
+
+    // Copy data from old to new
+    ggml_backend_tensor_set(tensor, old_data, 0, nbytes);
+
+    // Free old buffer
+    ggml_backend_buffer_free(old_buf);
+
+    return 0;
 }
 
 ggml_backend_t ggml_backend_sched_get_tensor_backend(ggml_backend_sched_t sched, struct ggml_tensor * node) {

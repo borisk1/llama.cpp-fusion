@@ -23,6 +23,7 @@
 #include <fstream>
 #include <iostream>
 #include <iterator>
+#include <list>
 #include <regex>
 #include <sstream>
 #include <string>
@@ -1236,6 +1237,65 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         return;
     }
 
+    // Auto-placement two-phase reload:
+    // Profile model → save placement → reload with overrides
+    if (params.auto_placement || params.profile_tensors) {
+        std::ifstream plf("/tmp/llama_placement.cfg");
+        if (plf.good()) {
+            LLAMA_LOG_INFO("%s: placement file found, attempting reload with overrides\n", __func__);
+
+            // Read the placement file and create override entries
+            std::vector<llama_model_tensor_buft_override> tbl_ov;
+            std::string line;
+            while (std::getline(plf, line)) {
+                if (line.empty() || line[0] == '#') continue;
+                auto eq = line.find('=');
+                if (eq == std::string::npos) continue;
+                std::string tname = line.substr(0, eq);
+                std::string bname = line.substr(eq + 1);
+
+                // Resolve buffer type name to a buffer type pointer
+                ggml_backend_buffer_type_t buft = nullptr;
+                if (bname == "CPU") {
+                    buft = ggml_backend_cpu_buffer_type();
+                } else {
+                    auto * dev = ggml_backend_dev_by_name(bname.c_str());
+                    if (dev) {
+                        buft = ggml_backend_dev_buffer_type(dev);
+                    }
+                }
+                if (buft) {
+                    static std::list<std::string> patterns;
+                    patterns.push_back(std::string("\\b") + tname + "\\b");
+                    tbl_ov.push_back({patterns.back().c_str(), buft});
+                }
+            }
+
+            if (!tbl_ov.empty()) {
+                tbl_ov.push_back({nullptr, nullptr});
+
+                // Save original model in case reload fails
+                auto * original_model = model;
+
+                // Reload with overrides (disable profiling)
+                mparams.profile_tensors    = false;
+                mparams.auto_placement     = false;
+                mparams.tensor_buft_overrides = tbl_ov.data();
+
+                model = llama_model_load_from_file(params.model.path.c_str(), mparams);
+                if (model == NULL) {
+                    COM_ERR("%s", "failed to reload model with overrides, using original\n");
+                    model = original_model; // fallback to original
+                } else {
+                    // Free the original (profiled) model
+                    llama_model_free(original_model);
+                    LLAMA_LOG_INFO("%s: model reloaded with %zu tensor overrides\n",
+                                  __func__, tbl_ov.size() - 1);
+                }
+            }
+        }
+    }
+
     pimpl->model.reset(model);
 
     if (model_only) {
@@ -1320,13 +1380,20 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     // Enable dynamic transfer if requested
     if (params.dynamic_transfer) {
         lctx->set_dynamic_transfer(true);
+        lctx->init_dynamic_transfer();
         LLAMA_LOG_INFO("%s: dynamic transfer enabled\n", __func__);
     }
 
     // Enable async coordination if requested
     if (params.async_coord) {
         lctx->set_async_coord(true);
-        LLAMA_LOG_INFO("%s: async coordination enabled\n", __func__);
+    }
+    if (params.epd) {
+        lctx->set_epd(true);
+    }
+    if (params.mtp_prefetch) {
+        lctx->set_mtp_prefetch(true);
+        LLAMA_LOG_INFO("%s: MTP prefetch enabled\n", __func__);
     }
 
     pimpl->context.reset(lctx);
@@ -1582,6 +1649,7 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.auto_placement   = params.auto_placement;
     mparams.dynamic_transfer = params.dynamic_transfer;
     mparams.async_coord      = params.async_coord;
+    mparams.epd              = params.epd;
 
     if (params.kv_overrides.empty()) {
         mparams.kv_overrides = NULL;

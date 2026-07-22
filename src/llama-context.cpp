@@ -10,12 +10,24 @@
 #include "llama-mmap.h"
 #include "llama-hot-cache.h"
 #include "llama-hot-cache-integration.h"
+#include "../ggml/src/ggml-backend-moe-cache.h"
+#include "llama-async-coord.h"
+#include "llama-dynamic-transfer.h"
 #include "llama-model.h"
 #include "llama-ext.h"
 #include "llama.h"
-
+#include "llama.h"
 #include <cinttypes>
 #include <cmath>
+
+// CUDA event timing + async H2D (extern C from llama-cuda-stream.cu)
+extern "C" {
+    void * llama_cuda_event_create();
+    void   llama_cuda_event_destroy(void *);
+    int    llama_cuda_event_record(void *, void *);
+    int    llama_cuda_event_sync(void *);
+    float  llama_cuda_event_elapsed_ms(void *, void *);
+}
 #include <cstring>
 #include <limits>
 #include <stdexcept>
@@ -370,6 +382,33 @@ llama_context::llama_context(
         }
 
         LLAMA_LOG_DEBUG("%s: backend_ptrs.size() = %zu\n", __func__, backend_ptrs.size());
+
+        // Initialize async coordination if enabled
+        if (async_coord_enabled) {
+            _async_coord = std::make_unique<llama_async_coord>();
+            // Find first GPU backend
+            ggml_backend_t gpu_backend = nullptr;
+            for (auto * be : backend_ptrs) {
+                auto * dev = ggml_backend_get_device(be);
+                if (dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_ACCEL) {
+                    gpu_backend = be;
+                    break;
+                }
+            }
+            if (gpu_backend) {
+                _async_coord->init(gpu_backend, backend_cpu);
+                // Initialize temporary GPU buffer pool for Dynamic Transfer
+                // Max tensor size = 256 MB (covers all DSV4 weight tensors)
+                _async_coord->init_temp_pool(256ULL * 1024 * 1024, 4);
+            }
+        }
+
+        // Initialize dynamic transfer scheduler
+        if (dynamic_transfer_enabled) {
+            _dynamic_transfer = std::make_unique<llama_dynamic_transfer>();
+            _dynamic_transfer->init(30.0); // PCIe 3.0 x16 ~30 GB/s
+            LLAMA_LOG_INFO("%s: dynamic transfer scheduler initialized\n", __func__);
+        }
 
         // TODO: move these checks to ggml_backend_sched
         // enabling pipeline parallelism in the scheduler increases memory usage, so it is only done when necessary
@@ -1382,9 +1421,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     hot_cache_readback_from_result(res, gtype == LLM_GRAPH_TYPE_DECODER_MTP ? 1 : 0,
         (int) ubatch.n_tokens, ubatch.pos, ubatch.token);
 
-    // MTP-guided prefetch: feed draft routing into hot-cache
-    // to predict which experts the main model will need next
-    if (gtype == LLM_GRAPH_TYPE_DECODER_MTP && hot_cache_is_active()) {
+    // MTP-guided prefetch: feed routing into hot-cache + moe-cache
+    if (mtp_prefetch_enabled) {
         auto * gf = res->get_gf();
         if (gf) {
             int nn = ggml_graph_n_nodes(gf);
@@ -1392,20 +1430,121 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                 ggml_tensor * t = ggml_graph_node(gf, i);
                 const char * nm = ggml_get_name(t);
                 if (!nm || !strstr(nm, "ffn_moe_topk")) continue;
-                // Extract layer from tensor name
                 const char * dash = strrchr(nm, '-');
                 if (!dash) continue;
                 int layer = atoi(dash + 1);
                 if (layer < 0 || layer >= (int)model.hparams.n_layer()) continue;
-                // Read top-k expert indices
                 int n_sel = (int)t->ne[0];
                 if (n_sel <= 0 || n_sel > 64) continue;
                 std::vector<int32_t> experts(n_sel);
                 if (t->buffer) {
                     ggml_backend_tensor_get(t, experts.data(), 0, n_sel * sizeof(int32_t));
                 }
-                // Feed to hot-cache (during warmup or if hot_cache_record accepts after activation)
-                hot_cache_record(layer, experts.data(), n_sel);
+                // Prefetch predicted experts into moe-cache (async, overlapped)
+                if (ggml_moe_cache.prefetch) {
+                    for (int j = 0; j < n_sel; j++) {
+                        int eid = experts[j];
+                        if (eid >= 0 && eid < model.hparams.n_expert) {
+                            ggml_moe_cache.prefetch(layer, eid, 0);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Dynamic Transfer & Load-aware Re-scheduling (§4.4, Algorithm 2 + Algorithm 3)
+    if (dynamic_transfer_enabled && _dynamic_transfer && gtype == LLM_GRAPH_TYPE_DECODER) {
+        dt_sched_step_count++;
+
+        // Track timing history for load-aware re-scheduling (Algorithm 3)
+        // Measure actual step latency using chrono
+        static auto last_step_time = std::chrono::high_resolution_clock::now();
+        auto now = std::chrono::high_resolution_clock::now();
+        double step_ms = std::chrono::duration<double, std::milli>(now - last_step_time).count();
+        last_step_time = now;
+
+        // Rolling average of step latency (exponential moving average)
+        static double avg_step_ms = 50.0; // ~50ms initial guess
+        if (step_ms > 0 && step_ms < 5000) { // sanity check
+            avg_step_ms = avg_step_ms * 0.9 + step_ms * 0.1;
+        }
+
+        // Run DP and load-aware re-scheduling
+        // DP runs every 5 steps; re-scheduling is triggered when deviation > 15%
+        // (Algorithm 3: deviation threshold ε = 15%, minimum interval τ = 5 × TPOT)
+        static int last_reschedule_step = -100;
+        static double expected_latency = 50.0;
+        static double cpu_slowdown = 1.0, gpu_slowdown = 1.0;
+
+        // Calculate deviation: how much actual step time differs from expected
+        double deviation = (expected_latency > 0)
+            ? std::abs(step_ms - expected_latency) / expected_latency
+            : 0.0;
+
+        bool need_reschedule = false;
+        if (dt_sched_step_count > 20 && deviation > 0.15) {
+            int steps_since_reschedule = dt_sched_step_count - last_reschedule_step;
+            double min_interval = std::max(5.0, 5.0 * avg_step_ms / 50.0); // ~5 × TPOT
+            if (steps_since_reschedule >= (int)min_interval) {
+                need_reschedule = true;
+                last_reschedule_step = dt_sched_step_count;
+
+                // Update load factors based on recent timing
+                // If step is slower than expected, the bottleneck backend is degrading
+                if (step_ms > expected_latency * 1.1) {
+                    // Infer which backend is slower based on recent DP decisions
+                    // For now: adjust both proportionally
+                    double ratio = step_ms / std::max(expected_latency, 0.1);
+                    cpu_slowdown = std::min(cpu_slowdown * (0.5 + ratio * 0.5), 2.0);
+                    gpu_slowdown = std::min(gpu_slowdown * (0.5 + ratio * 0.5), 2.0);
+                } else if (step_ms < expected_latency * 0.9) {
+                    // Step is faster → recover slowdown factors
+                    cpu_slowdown = std::max(cpu_slowdown * 0.95, 1.0);
+                    gpu_slowdown = std::max(gpu_slowdown * 0.95, 1.0);
+                }
+
+                if (dt_sched_step_count % 10 == 0) {
+                    fprintf(stderr, "DT_LOAD: dev=%.2f cpu=%.2f gpu=%.2f step=%.1fms (avg %.1fms)\n",
+                            deviation, cpu_slowdown, gpu_slowdown, step_ms, avg_step_ms);
+                }
+            }
+        }
+
+        // Run DP every 5 decode steps (or when re-scheduling is triggered)
+        if (dt_sched_step_count % 5 == 0 || need_reschedule) {
+            // Build tensor info list
+            std::vector<dt_tensor_info> dtensors;
+            const auto & profiler_entries = runtime_profiler.get_entries();
+            for (const auto & [name, entry] : profiler_entries) {
+                if (entry.count == 0 || entry.size == 0) continue;
+                dt_tensor_info info;
+                info.name = name;
+                info.size = entry.size;
+                info.t_cpu = entry.t_cpu / std::max(entry.count, 1);
+                info.t_gpu = entry.t_gpu / std::max(entry.count, 1);
+                info.activation_size = 4096 * sizeof(float);
+                info.layer = entry.layer;
+                info.op_type = entry.op_type;
+                info.is_gpu_default = true; // assume all on GPU for now
+                dtensors.push_back(info);
+            }
+
+            if (!dtensors.empty()) {
+                auto plan = _dynamic_transfer->solve(dtensors, 30.0, cpu_slowdown, gpu_slowdown);
+                expected_latency = 0;
+                // Estimate expected latency from plan
+                for (const auto & info : dtensors) {
+                    expected_latency += info.is_gpu_default
+                        ? info.t_gpu * gpu_slowdown
+                        : info.t_cpu * cpu_slowdown;
+                }
+
+                if (plan.valid && plan.n_promoted > 0 && dt_sched_step_count % 10 == 0) {
+                    fprintf(stderr, "DT_BUILD: promote %d tensors (%.0f MB, benefit %.2f ms, exposed %.2f ms)\n",
+                            plan.n_promoted, plan.total_transfer_bytes / (1024.0*1024.0),
+                            plan.estimated_benefit_ms, plan.exposed_transfer_ms);
+                }
             }
         }
     }
@@ -1427,6 +1566,14 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     ret = GGML_STATUS_SUCCESS;
 
     return res;
+}
+
+void llama_context::init_dynamic_transfer() {
+    if (!_dynamic_transfer) {
+        _dynamic_transfer = std::make_unique<llama_dynamic_transfer>();
+        _dynamic_transfer->init(30.0);
+        LLAMA_LOG_INFO("%s: dynamic transfer scheduler initialized\n", __func__);
+    }
 }
 
 int llama_context::encode(const llama_batch & batch_inp) {
@@ -2503,12 +2650,115 @@ ggml_status llama_context::graph_compute(
         ggml_threadpool_set_hierarchical_barrier(tp, false);
     }
 
+    // Async coordination: sync prefetch stream + start tensor prefetch before compute
+    // Async coordination: sync prefetch stream before compute
+    if (async_coord_enabled) {
+        ac_step_count++;
+
+        // Sync prefetch stream (ensures pending transfers from previous step done)
+        if (_async_coord) {
+            _async_coord->sync();
+        }
+
+        // Start async prefetch of CPU→GPU tensors for this graph
+        if (sched && gf && ac_step_count > 5) {
+            int n = ggml_backend_sched_prefetch_graph_tensors(sched.get(), gf, 
+                _async_coord ? _async_coord->get_cuda_stream() : nullptr);
+            if (n > 0 && ac_step_count % 10 == 0) {
+                fprintf(stderr, "AC: prefetched %d tensors before compute\n", n);
+            }
+        }
+
+        if (ac_step_count % 10 == 0) {
+            fprintf(stderr, "AC: step %d, batch=%d\n",
+                    ac_step_count, (int)batched);
+        }
+    }
+
+    // Runtime EPD (Execution Plane Descriptor) measurement
+    // Record CUDA events around graph compute to measure actual GPU time
+    void * epd_ev_start = nullptr;
+    void * epd_ev_stop  = nullptr;
+    if (epd_enabled) {
+        epd_step_count++;
+        epd_ev_start = (void *)llama_cuda_event_create();
+        epd_ev_stop  = (void *)llama_cuda_event_create();
+        if (epd_ev_start && epd_ev_stop) {
+            // Record start event on the backend's default stream
+            // We use the CUDA stream from the GPU backend
+            llama_cuda_event_record(epd_ev_start, nullptr); // default stream
+        }
+    }
+
     auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
     }
 
-    // Dynamic transfer: record perf sample if enabled
+    // Sync GPU and record end event
+    if (epd_enabled && epd_ev_start && epd_ev_stop) {
+        llama_cuda_event_record(epd_ev_stop, nullptr);
+        llama_cuda_event_sync(epd_ev_stop);
+        float gpu_ms = llama_cuda_event_elapsed_ms(epd_ev_start, epd_ev_stop);
+        llama_cuda_event_destroy(epd_ev_start);
+        llama_cuda_event_destroy(epd_ev_stop);
+
+        // Accumulate EPD samples per layer/tensor name
+        if (gf && gpu_ms > 0 && gpu_ms < 60000) { // sanity: < 60s
+            // Scan graph for tensor ops and record their execution
+            int nn = ggml_graph_n_nodes(gf);
+            if (nn > 0) {
+                // Distribute GPU time across all nodes equally as a first approximation
+                // (real EPD would measure each node individually)
+                float per_node_ms = gpu_ms / nn;
+                for (int i = 0; i < nn; i++) {
+                    struct ggml_tensor * op = ggml_graph_node(gf, i);
+                    if (!op) continue;
+                    const char * nm = ggml_get_name(op);
+                    if (!nm || !nm[0]) continue;
+                    // For weight-input ops (MUL_MAT with weight src), record per-weight-name
+                    for (int j = 0; j < GGML_MAX_SRC; j++) {
+                        struct ggml_tensor * src = op->src[j];
+                        if (!src || !src->buffer) continue;
+                        const char * src_nm = ggml_get_name(src);
+                        if (!src_nm || !src_nm[0]) continue;
+                        if (!strstr(src_nm, ".weight")) continue;
+                        // Found a weight tensor input - record this op's time
+                        epd_record_sample(src_nm, op->op, per_node_ms);
+                    }
+                }
+                // Log every N steps
+                if (epd_step_count % 20 == 0) {
+                    fprintf(stderr, "EPD: step %d, graph %.1f ms, %d nodes, %.3f ms/node\n",
+                            epd_step_count, gpu_ms, nn, per_node_ms);
+                    // Record measurement in runtime_profiler for auto-reknapsack
+                    // Distribute GPU time across graph nodes proportionally
+                    for (int i = 0; i < nn; i++) {
+                        struct ggml_tensor * op = ggml_graph_node(gf, i);
+                        if (!op) continue;
+                        // Only ops with weight inputs
+                        if (op->op != GGML_OP_MUL_MAT && op->op != GGML_OP_MUL_MAT_ID) continue;
+                        for (int j = 0; j < GGML_MAX_SRC && j < 2; j++) {
+                            struct ggml_tensor * src = op->src[j];
+                            if (!src || !src->buffer || !src->data) continue;
+                            const char * src_nm = ggml_get_name(src);
+                            if (!src_nm || !src_nm[0]) continue;
+                            if (!strstr(src_nm, ".weight")) continue;
+                            // Record with estimated CPU time (for benefit calc in knapsack)
+                            double est_cpu = (2.0 * ggml_nbytes(src)) / (40.0 * 1e9 / 1000.0);
+                            runtime_profiler.record_measurement(
+                                src_nm, ggml_op_name(op->op),
+                                ggml_nbytes(src), est_cpu, per_node_ms * 2);
+                        }
+                    }
+                    // Try to re-knapsack with EPD data
+                    epd_try_reknapsack(gf);
+                }
+            }
+        }
+    }
+
+    // Dynamic transfer: promote frequently-used CPU tensors to GPU
     if (dynamic_transfer_enabled) {
         dt_step_count++;
         auto now = std::chrono::high_resolution_clock::now();
@@ -2521,7 +2771,6 @@ ggml_status llama_context::graph_compute(
         dt_wi++;
 
         if (dt_step_count % 10 == 0) {
-            // Moving average over the window
             double avg = 0;
             int n = std::min(dt_wi, 10);
             for (int i = 0; i < n; i++) avg += dt_window[i];
@@ -2531,18 +2780,158 @@ ggml_status llama_context::graph_compute(
                     avg > 0 ? 1000.0 / (avg * 1.5) : 0);
         }
         dt_last_step = now;
-    }
 
-    // Async coordination: track compute latency per step
-    if (async_coord_enabled) {
-        ac_step_count++;
-        if (ac_step_count % 10 == 0) {
-            fprintf(stderr, "AC: step %d, batch=%d\n",
-                    ac_step_count, (int)batched);
+        // Dynamic tensor promotion: promote CPU tensors to GPU via scheduler
+        // NOTE: disabled because sched_promote_tensor invalidates scheduler state.
+        // Re-knapsack (EPD-based) handles placement changes after enough steps.
+        if (false && sched && gf && dt_step_count > 10 && (dt_step_count % 20 == 0)) {
+            int nn = ggml_graph_n_nodes(gf);
+            int promoted = 0;
+            static std::unordered_set<ggml_tensor*> seen;
+            for (int i = 0; i < nn && promoted < 2; i++) {
+                ggml_tensor * op = ggml_graph_node(gf, i);
+                if (!op) continue;
+                // Only check ops that take weight inputs (MUL_MAT, MUL_MAT_ID)
+                if (op->op != GGML_OP_MUL_MAT && op->op != GGML_OP_MUL_MAT_ID) continue;
+                // Check src[0] and src[1] (weight and activation)
+                for (int j = 0; j < GGML_MAX_SRC && promoted < 2; j++) {
+                    if (j > 1) break; // only first 2 src slots for MUL_MAT
+                    ggml_tensor * t = op->src[j];
+                    if (!t) continue;
+                    // Verify tensor is valid: check buffer pointer is non-null
+                    // and data pointer is reasonable (non-null)
+                    if (!t->buffer || !t->data) continue;
+                    if (t->view_src) continue;
+                    const char * nm = ggml_get_name(t);
+                    if (!nm || !nm[0]) continue;
+                    if (!strstr(nm, ".weight")) continue;
+                    if (seen.count(t)) continue;
+                    seen.insert(t);
+                    // Try promotion to first GPU backend
+                    auto * target = backend_ptrs.size() > 0 ? backend_ptrs[0] : nullptr;
+                    if (!target) continue;
+                    auto * cur = ggml_backend_sched_get_tensor_backend(sched.get(), t);
+                    if (cur == target) continue; // already on GPU
+                    if (ggml_backend_sched_promote_tensor(sched.get(), t, target) == 0) {
+                        promoted++;
+                        fprintf(stderr, "DT: promoted %s to GPU\n", nm);
+                    }
+                }
+            }
+            if (promoted > 0) {
+                fprintf(stderr, "DT: scheduler-promoted %d weight tensors (total seen: %zu)\n", promoted, seen.size());
+            }
         }
     }
 
     return status;
+}
+
+// ---- Runtime EPD sampling ----
+// Record a GPU execution time sample for a tensor operation.
+// Averages multiple samples to produce stable EPD values for knapsack.
+void llama_context::epd_record_sample(const char * tensor_name, enum ggml_op op, float gpu_ms) {
+    if (!tensor_name) return;
+    // Simple rolling average: store in an unordered_map
+    // Key = tensor_name, Value = {count, sum_ms}
+    static std::unordered_map<std::string, std::pair<int, double>> _epd_samples;
+    auto & entry = _epd_samples[tensor_name];
+    entry.first++;
+    entry.second += gpu_ms;
+    // Log every 50 samples per tensor
+    if (entry.first % 50 == 0) {
+        fprintf(stderr, "EPD: %s (op=%d) avg=%.4f ms (%d samples)\n",
+                tensor_name, (int)op, entry.second / entry.first, entry.first);
+    }
+}
+
+// Attempt to re-run knapsack with runtime EPD data
+// Called periodically after enough measurement samples
+void llama_context::epd_try_reknapsack(struct ggml_cgraph * current_gf) {
+    // Only re-knapsack at most 3 times
+    if (epd_reknapsack_count >= 3) return;
+
+    // Need at least 200 entries in the profiler
+    bool has_enough = false;
+    int n_entries = 0;
+    // We can't directly access runtime_profiler.entries (private),
+    // so we just check epd_step_count as a proxy
+    if (epd_step_count >= 100) {
+        has_enough = true;
+    }
+    if (!has_enough) return;
+
+    epd_reknapsack_count++;
+    fprintf(stderr, "EPD: re-knapsack #%d with runtime data (step=%d)\n",
+            epd_reknapsack_count, epd_step_count);
+
+    // Calculate EPD from recorded measurements
+    runtime_profiler.calculate_epd();
+
+    // Solve knapsack with SAFE budget: use total VRAM minus model minus moe-cache
+    // Initial budget from model loading (1785 MB for 1 GPU) is the correct reference.
+    // During inference, the moe-cache pool (11.5 GB) is also allocated.
+    size_t vram_budget = 0;
+    if (sched) {
+        for (int i = 0; i < ggml_backend_sched_get_n_backends(sched.get()); i++) {
+            auto * be = ggml_backend_sched_get_backend(sched.get(), i);
+            if (!be) continue;
+            auto * dev = ggml_backend_get_device(be);
+            if (!dev) continue;
+            if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_ACCEL) {
+                size_t total = 0, free = 0;
+                ggml_backend_dev_memory(dev, &free, &total);
+                // Use half of free VRAM to leave room for moe-cache, KV cache, etc.
+                vram_budget = free / 2;
+                fprintf(stderr, "EPD: VRAM free=%zu MB, budget=%zu MB (50%% of free)\n",
+                        free >> 20, vram_budget >> 20);
+                break;
+            }
+        }
+    }
+    if (vram_budget < 256ULL * 1024 * 1024) {
+        vram_budget = 256ULL * 1024 * 1024; // at least 256 MB
+    }
+
+    double pcie_bw = 12.0; // PCIe 3.0 x16 ≈ 12 GB/s effective
+    auto solution = runtime_profiler.solve_knapsack((double)vram_budget, pcie_bw);
+
+    fprintf(stderr, "EPD: knapsack re-solved: %zu GPU tensors (%.0f MB), benefit %.2f ms\n",
+            solution.gpu_tensors.size(), solution.total_size / (1024.0*1024.0),
+            solution.total_benefit);
+
+    // Apply solution: set tensor backends in the scheduler
+    // persistent_ids survive reset, but re-reserve is expensive.
+    // Disabled — use /tmp/llama_placement_epd.cfg for restart.
+    if (false && sched && current_gf && backend_ptrs.size() > 1) {
+        int applied = 0;
+        for (const auto & name : solution.gpu_tensors) {
+            struct ggml_tensor * t = ggml_graph_get_tensor(current_gf, name.c_str());
+            if (!t) continue;
+            if (!backend_ptrs.empty()) {
+                ggml_backend_sched_set_tensor_backend(sched.get(), t, backend_ptrs[0]);
+                applied++;
+            }
+        }
+        fprintf(stderr, "EPD: applied %d/%zu tensor backend changes\n",
+                applied, solution.gpu_tensors.size());
+    }
+
+    // Write placement to file for next restart
+    auto overrides = runtime_profiler.generate_overrides(solution);
+    if (!overrides.empty()) {
+        FILE * f = fopen("/tmp/llama_placement_epd.cfg", "w");
+        if (f) {
+            for (const auto & o : overrides) {
+                fprintf(f, "%s,", o.c_str());
+            }
+            fclose(f);
+            fprintf(stderr, "EPD: saved %zu overrides to /tmp/llama_placement_epd.cfg\n",
+                    overrides.size());
+        }
+    }
+
+    runtime_profiler.print_report();
 }
 
 llm_graph_cb llama_context::graph_get_cb() const {

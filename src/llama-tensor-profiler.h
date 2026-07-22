@@ -73,6 +73,9 @@ public:
     // Get top N tensors by benefit/size ratio for GPU placement
     std::vector<std::string> get_top_tensors(int n, double vram_budget_bytes) const;
 
+    // Get all profiling entries
+    const std::unordered_map<std::string, tensor_profile_entry> & get_entries() const { return entries; }
+
     // Clear all data
     void clear();
 

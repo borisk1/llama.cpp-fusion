@@ -2291,6 +2291,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_ASYNC_COORD"));
 
     add_opt(common_arg(
+        {"--epd"},
+        "[EXPERIMENTAL] enable runtime EPD (Execution Plane Descriptor) measurement",
+        [](common_params & params) {
+            params.epd = true;
+        }
+    ).set_env("LLAMA_ARG_EPD"));
+
+    add_opt(common_arg(
         {"--atsinfer"},
         "[EXPERIMENTAL] enable all ATSInfer features (profiling + placement + transfer + async)",
         [](common_params & params) {
@@ -2299,8 +2307,17 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.auto_placement = true;
             params.dynamic_transfer = true;
             params.async_coord = true;
+            params.epd = true;
         }
     ).set_env("LLAMA_ARG_ATSINFER"));
+
+    add_opt(common_arg(
+        {"--atsinfer-budget-mb"}, "N",
+        "[EXPERIMENTAL] simulated VRAM budget in MB for ATSInfer knapsack (0 = real free VRAM)",
+        [](common_params & params, int value) {
+            params.atsinfer_budget_mb = value;
+        }
+    ).set_env("LLAMA_ARG_ATSINFER_BUDGET"));
 
     add_opt(common_arg(
         {"--mtp-prefetch"},
